@@ -2,10 +2,15 @@
 郑重声明：文中所涉及的技术、思路和工具仅供以安全为目的的学习交流使用，任何人不得将其用于非法用途以及盈利等目的，否则后果自行承担。
 # 介绍
 作者：[p0desta](https://github.com/p0desta/)，[Y0!0](https://github.com/hooray195)，[0cat ](https://github.com/0cat-r) 
+
 团队：[0x727](https://github.com/0x727)，未来一段时间将陆续开源工具，地址：[https://github.com/0x727](https://github.com/0x727)
+
 定位：协助红队人员快速的信息收集，测绘目标资产，寻找薄弱点
+
 语言：Java11
+
 功能：权限绕过的自动化bypass的burpsuite插件。
+
 此项目是基于p0desta师傅的项目[https://github.com/p0desta/AutoBypass403-BurpSuite](https://github.com/p0desta/AutoBypass403-BurpSuite)进行二开的。用于权限绕过，403bypass等的自动化bypass的Burpsuite插件。感谢p0desta师傅的开源，本二开项目已经过p0desta师傅本人允许开源。
 
 # 新增加的功能
