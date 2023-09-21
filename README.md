@@ -41,3 +41,29 @@
 
 
 **注意事项**，该工具会一定程度上触发waf,所以当目标站点有waf 请关闭被动扫描。
+
+# 案例
+之前很多案例没有记录。这次bypasspro又发现了一个
+
+最近的JumpServer未授权访问漏洞(CVE-2023-42442)：未经身份验证的远程攻击者利用该漏洞可以访问录像文件，远程获取到敏感信息。
+
+目前各大CERT给出的payload是/api/v1/terminal/sessions/ 或者/api/v1/terminal/sessions/?limit=1
+
+部分企业可能无法及时升级版本，在nginx或者其他设备做防护处理。
+
+比如访问原始payload
+<img width="985" alt="image" src="https://github.com/0x727/BypassPro/assets/49912303/bac05da4-451a-4b8e-a66a-32b17a20a1d2">
+
+
+ok BypassPro给出 bypass 的payload：/api/v1/terminal/sessions.json?limit=1
+
+![image](https://github.com/0x727/BypassPro/assets/49912303/361abfdd-58c3-4465-962b-6f747dc1d355)
+
+
+
+
+
+
+
+
+
