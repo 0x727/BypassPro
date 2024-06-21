@@ -2,6 +2,7 @@ package burp;
 
 import Main.*;
 import java.io.PrintWriter;
+import java.util.Map;
 
 public class BurpExtender implements IBurpExtender {
     private PrintWriter stdout;
@@ -9,7 +10,7 @@ public class BurpExtender implements IBurpExtender {
     public static IBurpExtenderCallbacks callbacks;
     private MainPanel panel;
     private String NAME = "BypassPro";
-    private String VERSION = "${version}";
+    private String VERSION = "3.0";
 
 
     public void registerExtenderCallbacks(IBurpExtenderCallbacks callbacks)
@@ -34,6 +35,10 @@ public class BurpExtender implements IBurpExtender {
         callbacks.registerContextMenuFactory(bypassMain);
         callbacks.registerProxyListener(bypassMain);
 
+        // 加载配置文件
+        Map<String, Object> config = Utils.loadConfig("/BypassPro-config.yaml");
+        Utils.setConfigMap(config);
+
         banner();
 
     }
@@ -42,7 +47,7 @@ public class BurpExtender implements IBurpExtender {
         this.stdout.println("===================================");
         this.stdout.println(String.format("%s loaded success", NAME));
         this.stdout.println(String.format("version: %s", VERSION));
-        this.stdout.println("droplab-Y0!0  0cat");
+        this.stdout.println("0x727-hooray195,  0cat");
         this.stdout.println("===================================");
     }
 

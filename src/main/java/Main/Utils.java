@@ -2,15 +2,13 @@ package Main;
 
 import burp.IBurpExtenderCallbacks;
 import burp.IExtensionHelpers;
-import burp.IHttpRequestResponse;
-import burp.IResponseInfo;
+import org.yaml.snakeyaml.Yaml;
 
+import java.io.InputStream;
 import java.io.PrintWriter;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.List;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
+import java.util.Map;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -23,7 +21,19 @@ public class Utils {
     private static PrintWriter stderr;
     static MainPanel panel;
     public static long count = 0;
-    public static boolean isSelected = true;
+    //主动扫描 默认为faulse
+    public static boolean isProxySelected = false;
+    public static Map<String, Object> configMap = null;
+    public static void setConfigMap(Map<String, Object> config) {
+
+        if (config.isEmpty()){
+            System.out.println("!! config内容为空,将保持原来的payload");
+            return;
+        }
+        Utils.configMap = config;
+
+    }
+
 
     public static void setBurpPresent(IBurpExtenderCallbacks incallbacks) {
         gotBurp = true;
@@ -65,7 +75,23 @@ public class Utils {
 
         return title.replaceAll("<.*?>", "");
     }
+    public static Map<String, Object> loadConfig(String filename){
+        Map<String, Object> yamlMap=null;
+        // 读取YAML文件
+        try {
+            InputStream inputStream = BypassMain.class.getResourceAsStream(filename);
 
+            Yaml yaml = new Yaml();
+            // 将YAML文件的内容加载为Map对象
+            yamlMap = yaml.load(inputStream);
+            inputStream.close();
+        } catch (Exception exception) {
+            System.out.println("配置文件加载失败，请检查配置文件 BypassPro-config.yaml");
+            exception.printStackTrace();
+        }
+        return yamlMap;
+
+    }
 
 
 }
