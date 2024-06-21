@@ -3,14 +3,15 @@ package Main;
 import burp.BurpExtender;
 import burp.ITab;
 import org.apache.commons.lang3.StringUtils;
+import org.yaml.snakeyaml.Yaml;
 
-import java.awt.Color;
 import java.awt.Component;
 import java.awt.FlowLayout;
 import java.awt.event.ActionEvent;
 import java.awt.event.ActionListener;
+import java.io.InputStream;
+import java.util.Map;
 import javax.swing.*;
-import javax.swing.table.DefaultTableCellRenderer;
 
 /**
  * Main display panel
@@ -66,17 +67,17 @@ public class MainPanel extends JPanel implements ITab {
 
         // 配置框 controlPanel
         JPanel controlPanel = new JPanel(new FlowLayout(FlowLayout.LEFT));
-        isAutoCheckBox = new JCheckBox("Passive Scan", true);
+        isAutoCheckBox = new JCheckBox("Passive Scan", false);
         controlPanel.add(isAutoCheckBox);
         //构造一个监听器，响应checkBox事件
         ActionListener actionListener = new ActionListener(){
             public void actionPerformed(ActionEvent e) {
                 if(isAutoCheckBox.isSelected())
                 {
-                    Utils.isSelected = true;
+                    Utils.isProxySelected = true;
                 } else
                 {
-                    Utils.isSelected = false;
+                    Utils.isProxySelected = false;
                 }
             }
         };
@@ -128,6 +129,24 @@ public class MainPanel extends JPanel implements ITab {
         });
 
         controlPanel.setAlignmentX(0);
+
+        // 添加重载配置文件控件
+        JButton reconfigButton = new JButton("reconfig");
+
+        controlPanel.add(reconfigButton);
+
+        reconfigButton.addActionListener(e -> {
+            Map<String, Object> config = Utils.loadConfig("/BypassPro-config.yaml");
+            Utils.setConfigMap(config);
+            System.out.println("reconfig success...");
+
+        });
+
+
+        // todo:添加filter
+
+
+
         add(controlPanel);
         add(splitPane);
 
