@@ -8,7 +8,7 @@ import static org.junit.Assert.assertTrue;
 public class DiffPageTest {
 
     @Test
-    public void compareIgnoresLargeTailBeforeRegexNormalization() {
+    public void compareIgnoresScriptChangesInLargeHtml() {
         String prefix = "<html><body>" + repeat('A', 9000);
         String a = prefix + "<script>" + repeat('X', 2000) + "</script></body></html>";
         String b = prefix + "<script>" + repeat('Y', 2000) + "</script></body></html>";
@@ -17,7 +17,7 @@ public class DiffPageTest {
     }
 
     @Test
-    public void filteredPageContentIsCappedBeforeRegexNormalization() {
+    public void filteredPageContentRemainsBounded() {
         String html = "<html><body>" + repeat('A', 9000) + "</body></html>";
 
         assertTrue(DiffPage.getFilteredPageContent(html).length() <= 8000);

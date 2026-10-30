@@ -10,7 +10,7 @@ public class BurpExtender implements IBurpExtender, IExtensionStateListener {
     public static IBurpExtenderCallbacks callbacks;
     private MainPanel panel;
     private String NAME = "BypassPro";
-    private String VERSION = "5.1";
+    private String VERSION = "5.2";
 
     public void registerExtenderCallbacks(IBurpExtenderCallbacks callbacks) {
 
@@ -52,6 +52,7 @@ public class BurpExtender implements IBurpExtender, IExtensionStateListener {
     @Override
     public void extensionUnloaded() {
         // 释放全局线程池，避免 Burp 资源泄漏
+        javax.swing.SwingUtilities.invokeLater(() -> { if (panel != null) panel.dispose(); });
         Utils.shutdownSharedExecutor();
     }
 

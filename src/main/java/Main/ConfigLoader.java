@@ -8,7 +8,6 @@ import org.yaml.snakeyaml.representer.Representer;
 
 import java.io.File;
 import java.io.FileOutputStream;
-import java.io.FileWriter;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.URI;
@@ -30,12 +29,19 @@ public class ConfigLoader {
     private static final String CLASSPATH_RESOURCE = "BypassPro-config.yaml";
 
     private final Yaml yaml;
+    private String lastError;
+
+    public String getLastError() { return lastError; }
     private final String configDirPath;
     private final String configFilePath;
 
     public ConfigLoader() {
+        this(determineConfigDirPath());
+    }
+
+    ConfigLoader(String configDirPath) {
         this.yaml = createSecureYaml();
-        this.configDirPath = determineConfigDirPath();
+        this.configDirPath = configDirPath;
         this.configFilePath = this.configDirPath + File.separator + CONFIG_FILE_NAME;
 
         File dir = new File(this.configDirPath);
@@ -53,16 +59,20 @@ public class ConfigLoader {
         return configFilePath;
     }
 
-    public Map<String, Object> loadConfig() {
+    public synchronized Map<String, Object> loadConfig() {
+        lastError = null;
         Path p = Paths.get(configFilePath);
         if (!Files.exists(p)) {
+            lastError = "Configuration file does not exist";
             return Collections.emptyMap();
         }
 
         try (InputStream in = Files.newInputStream(p)) {
             Map<String, Object> m = yaml.load(in);
-            return m == null ? Collections.emptyMap() : m;
+            if (m == null || m.isEmpty()) throw new IllegalArgumentException("Configuration is empty");
+            return m;
         } catch (Exception e) {
+            lastError = e.getMessage();
             return Collections.emptyMap();
         }
     }
@@ -101,28 +111,32 @@ public class ConfigLoader {
     /**
      * 保存 general 配置（含 Follow Redirect 最大跳转次数）。
      */
-    public boolean saveGeneralConfig(int threads, int maxRedirects, double similarityThreshold, String lang) {
+    public synchronized boolean saveGeneralConfig(int threads, int maxRedirects, double similarityThreshold, String lang) {
+        lastError = null;
         try {
+            if (threads < 1 || threads > 100 || maxRedirects < 1 || maxRedirects > 10
+                    || !Double.isFinite(similarityThreshold) || similarityThreshold < 0 || similarityThreshold > 1) {
+                lastError = "Invalid threads, redirect limit or similarity threshold";
+                return false;
+            }
             String raw = readConfigText();
-            if (raw == null || raw.isEmpty()) {
-                Map<String, Object> config = loadConfig();
-                if (config.isEmpty()) {
-                    config = new LinkedHashMap<>();
-                }
-                Map<String, Object> general = new LinkedHashMap<>();
-                general.put("threads", threads);
-                general.put("max_redirects", maxRedirects);
-                general.put("similarity_threshold", similarityThreshold);
-                if (lang != null && !lang.isEmpty()) {
-                    general.put("lang", lang);
-                }
-                config.put("general", general);
-                return writeConfig(config);
+            if (raw == null || raw.trim().isEmpty()) {
+                lastError = "Configuration is empty or unreadable; restore it or use Init before saving";
+                return false;
             }
             String patched = patchGeneralSection(raw, threads, maxRedirects, similarityThreshold, lang);
+            Map<String, Object> expected = new LinkedHashMap<>();
+            expected.put("threads", threads);
+            expected.put("max_redirects", maxRedirects);
+            expected.put("similarity_threshold", similarityThreshold);
+            if (lang != null && !lang.isEmpty()) expected.put("lang", lang);
+            if (!containsValues(safeMap(yaml.load(patched)).get("general"), expected)) {
+                lastError = "Saved settings did not match submitted values; original file was retained";
+                return false;
+            }
             return writeConfigText(patched);
         } catch (Exception e) {
-            e.printStackTrace();
+            lastError = e.getMessage();
             return false;
         }
     }
@@ -133,57 +147,24 @@ public class ConfigLoader {
      * @return 是否保存成功
      */
     @SuppressWarnings("unchecked")
-    public boolean saveWafOptions(Map<String, Object> options) {
+    public synchronized boolean saveWafOptions(Map<String, Object> options) {
+        lastError = null;
         try {
             String raw = readConfigText();
-            if (raw == null || raw.isEmpty()) {
-                // 文件为空时退化为结构化写入
-                Map<String, Object> config = loadConfig();
-                if (config.isEmpty()) {
-                    config = new LinkedHashMap<>();
-                }
-                Object profilesObj = config.get("profiles");
-                Map<String, Object> profiles = profilesObj instanceof Map ? (Map<String, Object>) profilesObj : new LinkedHashMap<>();
-                config.put("profiles", profiles);
-                Object wafObj = profiles.get(Utils.PROFILE_AUTO_WAF_BYPASS);
-                Map<String, Object> waf = wafObj instanceof Map ? (Map<String, Object>) wafObj : new LinkedHashMap<>();
-                profiles.put(Utils.PROFILE_AUTO_WAF_BYPASS, waf);
-                waf.put("options", options);
-                return writeConfig(config);
+            if (raw == null || raw.trim().isEmpty()) {
+                lastError = "Configuration is empty or unreadable; restore it or use Init before saving";
+                return false;
             }
             String patched = patchWafOptionsSection(raw, options);
-            if (patched == null) {
+            Map<String, Object> saved = patched == null ? Collections.emptyMap() : safeMap(yaml.load(patched));
+            Object savedOptions = safeMap(safeMap(saved.get("profiles")).get(Utils.PROFILE_AUTO_WAF_BYPASS)).get("options");
+            if (patched == null || !containsValues(savedOptions, options)) {
+                lastError = "Saved options did not match the submitted values; original file was retained";
                 return false;
             }
             return writeConfigText(patched);
         } catch (Exception e) {
-            e.printStackTrace();
-            return false;
-        }
-    }
-
-    /**
-     * 写入配置到文件
-     */
-    private boolean writeConfig(Map<String, Object> config) {
-        try {
-            // 使用更漂亮的格式
-            DumperOptions dop = new DumperOptions();
-            dop.setDefaultFlowStyle(DumperOptions.FlowStyle.BLOCK);
-            dop.setPrettyFlow(true);
-            dop.setIndent(2);
-            dop.setIndicatorIndent(2);
-            dop.setIndentWithIndicator(true);
-
-            Representer representer = new Representer(dop);
-            Yaml yamlWriter = new Yaml(representer, dop);
-
-            try (FileWriter writer = new FileWriter(configFilePath)) {
-                yamlWriter.dump(config, writer);
-            }
-            return true;
-        } catch (Exception e) {
-            e.printStackTrace();
+            lastError = e.getMessage();
             return false;
         }
     }
@@ -191,10 +172,25 @@ public class ConfigLoader {
     private boolean writeConfigText(String text) {
         try {
             Path p = Paths.get(configFilePath);
-            Files.write(p, text.getBytes(StandardCharsets.UTF_8));
+            if (!(yaml.load(text) instanceof Map)) {
+                lastError = "Configuration must be a YAML mapping";
+                return false;
+            }
+            Path temp = Files.createTempFile(p.getParent(), "BypassPro-", ".yaml.tmp");
+            try {
+                Files.write(temp, text.getBytes(StandardCharsets.UTF_8));
+                try {
+                    Files.move(temp, p, java.nio.file.StandardCopyOption.REPLACE_EXISTING,
+                            java.nio.file.StandardCopyOption.ATOMIC_MOVE);
+                } catch (java.nio.file.AtomicMoveNotSupportedException e) {
+                    Files.move(temp, p, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+                }
+            } finally {
+                Files.deleteIfExists(temp);
+            }
             return true;
         } catch (Exception e) {
-            e.printStackTrace();
+            lastError = e.getMessage();
             return false;
         }
     }
@@ -220,10 +216,13 @@ public class ConfigLoader {
 
         int end = findTopLevelSectionEnd(lines, generalIdx);
         patchScalarInSection(lines, generalIdx + 1, end, 2, "threads", String.valueOf(threads));
+        end = findTopLevelSectionEnd(lines, generalIdx);
         patchScalarAfterKeyInSection(lines, generalIdx + 1, end, 2,
                 "max_redirects", String.valueOf(maxRedirects), "threads");
+        end = findTopLevelSectionEnd(lines, generalIdx);
         patchScalarInSection(lines, generalIdx + 1, end, 2, "similarity_threshold", String.valueOf(similarityThreshold));
         if (lang != null && !lang.isEmpty()) {
+            end = findTopLevelSectionEnd(lines, generalIdx);
             patchScalarInSection(lines, generalIdx + 1, end, 2, "lang", lang);
         }
         return String.join("\n", lines);
@@ -269,160 +268,43 @@ public class ConfigLoader {
         if (optionsIdx < 0) {
             return null;
         }
-        int optionsEnd = findSectionEndByIndent(lines, optionsIdx, 4);
-
-        // 只更新已知开关（保持注释/格式）：body_charset/body_transform/content_type_spoof/ghost_bits
-        Map<String, Object> bodyCharset = safeMap(options.get("body_charset"));
-        Map<String, Object> bodyTransform = safeMap(options.get("body_transform"));
-        Map<String, Object> contentTypeSpoof = safeMap(options.get("content_type_spoof"));
-        Map<String, Object> ghostBits = safeMap(options.get("ghost_bits"));
-
-        patchNestedBools(lines, optionsIdx + 1, optionsEnd, "body_charset", 6, bodyCharset);
-        patchNestedBools(lines, optionsIdx + 1, optionsEnd, "body_transform", 6, bodyTransform);
-        patchNestedBools(lines, optionsIdx + 1, optionsEnd, "content_type_spoof", 6, contentTypeSpoof);
-        ensureGhostBitsOptionsSection(lines, optionsIdx, ghostBits);
-        optionsEnd = findSectionEndByIndent(lines, optionsIdx, 4);
-        patchGhostBitsOptions(lines, optionsIdx + 1, optionsEnd, ghostBits);
-
+        patchOptionMap(lines, optionsIdx, 4, options);
         return String.join("\n", lines);
     }
 
-    private void ensureGhostBitsOptionsSection(ArrayList<String> lines, int optionsIdx, Map<String, Object> ghostBits) {
-        if (ghostBits == null || ghostBits.isEmpty()) return;
-        int optionsEnd = findSectionEndByIndent(lines, optionsIdx, 4);
-        if (findChildKey(lines, optionsIdx + 1, optionsEnd, 6, "ghost_bits") >= 0) {
-            return;
-        }
-        int insertAt = Math.min(optionsEnd, lines.size());
-        Map<String, Object> templates = safeMap(ghostBits.get("templates"));
-        Map<String, Object> generic = safeMap(ghostBits.get("generic"));
-        lines.add(insertAt++, "");
-        lines.add(insertAt++, repeatSpace(6) + "# Ghost Bits 自动绕过（eq/parser 候选，非漏洞确认）");
-        lines.add(insertAt++, repeatSpace(6) + "ghost_bits:");
-        lines.add(insertAt++, repeatSpace(8) + "enabled: " + boolText(ghostBits.get("enabled"), false));
-        lines.add(insertAt++, repeatSpace(8) + "raw_socket: " + boolText(ghostBits.get("raw_socket"), true));
-        Object maxVariants = ghostBits.get("max_variants");
-        lines.add(insertAt++, repeatSpace(8) + "max_variants: "
-                + (maxVariants == null ? "10" : maxVariants.toString()));
-        if (!templates.isEmpty()) {
-            lines.add(insertAt++, "");
-            lines.add(insertAt++, repeatSpace(8) + "templates:");
-            for (Map.Entry<String, Object> e : templates.entrySet()) {
-                if (e.getKey() == null) continue;
-                lines.add(insertAt++, repeatSpace(10) + e.getKey() + ": " + boolText(e.getValue(), false));
-            }
-        }
-        if (!generic.isEmpty()) {
-            Map<String, Object> strategies = safeMap(generic.get("strategies"));
-            lines.add(insertAt++, "");
-            lines.add(insertAt++, repeatSpace(8) + "generic:");
-            lines.add(insertAt++, repeatSpace(10) + "enabled: " + boolText(generic.get("enabled"), false));
-            if (!strategies.isEmpty()) {
-                lines.add(insertAt++, repeatSpace(10) + "strategies:");
-                for (Map.Entry<String, Object> e : strategies.entrySet()) {
-                    if (e.getKey() == null) continue;
-                    lines.add(insertAt++, repeatSpace(12) + e.getKey() + ": " + boolText(e.getValue(), false));
+    // Recompute the section boundary after every insertion. Keep user comments and unrelated rules.
+    private void patchOptionMap(ArrayList<String> lines, int parent, int indent, Map<String, Object> values) {
+        for (Map.Entry<String, Object> entry : values.entrySet()) {
+            String key = entry.getKey();
+            if (key == null || !key.matches("[A-Za-z0-9_]+"))
+                throw new IllegalArgumentException("Invalid option key");
+            int end = findSectionEndByIndent(lines, parent, indent);
+            Object value = entry.getValue();
+            if (value instanceof Map) {
+                int child = findChildKey(lines, parent + 1, end, indent + 2, key);
+                if (child < 0) {
+                    child = end;
+                    lines.add(child, repeatSpace(indent + 2) + key + ":");
                 }
-            }
-            Object variantCount = generic.get("variant_count");
-            lines.add(insertAt++, repeatSpace(10) + "variant_count: "
-                    + (variantCount == null ? "3" : variantCount.toString()));
-        }
-    }
-
-    private String boolText(Object value, boolean defaultValue) {
-        if (value instanceof Boolean) {
-            return ((Boolean) value) ? "true" : "false";
-        }
-        return defaultValue ? "true" : "false";
-    }
-
-    private void patchGhostBitsOptions(ArrayList<String> lines, int start, int end, Map<String, Object> ghostBits) {
-        if (ghostBits == null || ghostBits.isEmpty()) return;
-        int ghostIdx = findChildKey(lines, start, end, 6, "ghost_bits");
-        if (ghostIdx < 0) return;
-        int ghostEnd = findSectionEndByIndent(lines, ghostIdx, 6);
-
-        patchBooleanScalar(lines, ghostIdx + 1, ghostEnd, 8, "enabled", ghostBits.get("enabled"));
-        patchBooleanScalar(lines, ghostIdx + 1, ghostEnd, 8, "raw_socket", ghostBits.get("raw_socket"));
-        Object maxVariants = ghostBits.get("max_variants");
-        if (maxVariants instanceof Number) {
-            patchScalarInSection(lines, ghostIdx + 1, ghostEnd, 8,
-                    "max_variants", String.valueOf(((Number) maxVariants).intValue()));
-        } else if (maxVariants != null) {
-            patchScalarInSection(lines, ghostIdx + 1, ghostEnd, 8,
-                    "max_variants", maxVariants.toString());
-        }
-
-        Map<String, Object> templates = safeMap(ghostBits.get("templates"));
-        patchNestedBools(lines, ghostIdx + 1, ghostEnd, "templates", 10, templates);
-
-        Map<String, Object> generic = safeMap(ghostBits.get("generic"));
-        ensureGhostGenericSection(lines, ghostIdx, generic);
-        ghostEnd = findSectionEndByIndent(lines, ghostIdx, 6);
-        patchGhostGenericOptions(lines, ghostIdx + 1, ghostEnd, generic);
-    }
-
-    private void ensureGhostGenericSection(ArrayList<String> lines, int ghostIdx, Map<String, Object> generic) {
-        if (generic == null || generic.isEmpty()) return;
-        int ghostEnd = findSectionEndByIndent(lines, ghostIdx, 6);
-        if (findChildKey(lines, ghostIdx + 1, ghostEnd, 8, "generic") >= 0) {
-            return;
-        }
-        int insertAt = Math.min(ghostEnd, lines.size());
-        Map<String, Object> strategies = safeMap(generic.get("strategies"));
-        lines.add(insertAt++, "");
-        lines.add(insertAt++, repeatSpace(8) + "generic:");
-        lines.add(insertAt++, repeatSpace(10) + "enabled: " + boolText(generic.get("enabled"), false));
-        if (!strategies.isEmpty()) {
-            lines.add(insertAt++, repeatSpace(10) + "strategies:");
-            for (Map.Entry<String, Object> e : strategies.entrySet()) {
-                if (e.getKey() == null) continue;
-                lines.add(insertAt++, repeatSpace(12) + e.getKey() + ": " + boolText(e.getValue(), false));
+                patchOptionMap(lines, child, indent + 2, safeMap(value));
+            } else if (value instanceof Boolean || value instanceof Number) {
+                patchScalarInSection(lines, parent + 1, end, indent + 2, key, value.toString());
+            } else {
+                throw new IllegalArgumentException("Unsupported option value: " + key);
             }
         }
-        Object variantCount = generic.get("variant_count");
-        lines.add(insertAt++, repeatSpace(10) + "variant_count: "
-                + (variantCount == null ? "3" : variantCount.toString()));
     }
 
-    private void patchGhostGenericOptions(ArrayList<String> lines, int start, int end, Map<String, Object> generic) {
-        if (generic == null || generic.isEmpty()) return;
-        int genericIdx = findChildKey(lines, start, end, 8, "generic");
-        if (genericIdx < 0) return;
-        int genericEnd = findSectionEndByIndent(lines, genericIdx, 8);
-
-        patchBooleanScalar(lines, genericIdx + 1, genericEnd, 10, "enabled", generic.get("enabled"));
-        Map<String, Object> strategies = safeMap(generic.get("strategies"));
-        patchNestedBools(lines, genericIdx + 1, genericEnd, "strategies", 12, strategies);
-        Object variantCount = generic.get("variant_count");
-        if (variantCount instanceof Number) {
-            patchScalarInSection(lines, genericIdx + 1, genericEnd, 10,
-                    "variant_count", String.valueOf(((Number) variantCount).intValue()));
-        } else if (variantCount != null) {
-            patchScalarInSection(lines, genericIdx + 1, genericEnd, 10,
-                    "variant_count", variantCount.toString());
+    private boolean containsValues(Object actual, Map<String, Object> expected) {
+        if (!(actual instanceof Map) || expected == null) return false;
+        Map<?, ?> map = (Map<?, ?>) actual;
+        for (Map.Entry<String, Object> entry : expected.entrySet()) {
+            Object value = entry.getValue();
+            if (value instanceof Map) {
+                if (!containsValues(map.get(entry.getKey()), safeMap(value))) return false;
+            } else if (!java.util.Objects.equals(value, map.get(entry.getKey()))) return false;
         }
-    }
-
-    private void patchBooleanScalar(ArrayList<String> lines, int start, int end, int indent, String key, Object value) {
-        if (value instanceof Boolean) {
-            patchScalarInSection(lines, start, end, indent, key, ((Boolean) value) ? "true" : "false");
-        }
-    }
-
-    private void patchNestedBools(ArrayList<String> lines, int start, int end, String sectionKey, int childIndent, Map<String, Object> boolMap) {
-        if (boolMap == null || boolMap.isEmpty()) return;
-        int secIdx = findChildKey(lines, start, end, childIndent - 2, sectionKey);
-        if (secIdx < 0) return;
-        int secEnd = findSectionEndByIndent(lines, secIdx, childIndent - 2);
-        for (Map.Entry<String, Object> e : boolMap.entrySet()) {
-            String k = e.getKey();
-            if (k == null) continue;
-            Boolean v = (e.getValue() instanceof Boolean) ? (Boolean) e.getValue() : null;
-            if (v == null) continue;
-            patchScalarInSection(lines, secIdx + 1, secEnd, childIndent, k, v ? "true" : "false");
-        }
+        return true;
     }
 
     private Map<String, Object> safeMap(Object o) {
@@ -475,7 +357,7 @@ public class ConfigLoader {
         for (int i = startIdx + 1; i < lines.size(); i++) {
             String line = lines.get(i);
             if (line == null) continue;
-            if (line.isEmpty()) continue;
+            if (line.trim().isEmpty() || line.trim().startsWith("#")) continue;
             int leading = countLeadingSpaces(line);
             if (leading <= indent && !line.startsWith("#")) {
                 return i;
@@ -485,13 +367,15 @@ public class ConfigLoader {
     }
 
     private static void patchScalarInSection(ArrayList<String> lines, int start, int end, int indent, String key, String value) {
-        Pattern p = Pattern.compile("^" + Pattern.quote(repeatSpace(indent) + key) + "\\s*:\\s*([^#]*)(.*)$");
+        // 将注释前的空白保留在 tail 中，避免数值/布尔值与 # 连成字符串。
+        Pattern p = Pattern.compile("^" + Pattern.quote(repeatSpace(indent) + key) + "\\s*:\\s*([^#]*?)([ \\t]*(?:#.*)?)$");
         for (int i = start; i < end && i < lines.size(); i++) {
             String line = lines.get(i);
             if (line == null) continue;
             Matcher m = p.matcher(line);
             if (m.find()) {
                 String tail = m.group(2) == null ? "" : m.group(2);
+                if (tail.startsWith("#")) tail = " " + tail;
                 lines.set(i, repeatSpace(indent) + key + ": " + value + tail);
                 return;
             }
@@ -503,13 +387,14 @@ public class ConfigLoader {
 
     private static void patchScalarAfterKeyInSection(ArrayList<String> lines, int start, int end, int indent,
                                                      String key, String value, String afterKey) {
-        Pattern target = Pattern.compile("^" + Pattern.quote(repeatSpace(indent) + key) + "\\s*:\\s*([^#]*)(.*)$");
+        Pattern target = Pattern.compile("^" + Pattern.quote(repeatSpace(indent) + key) + "\\s*:\\s*([^#]*?)([ \\t]*(?:#.*)?)$");
         for (int i = start; i < end && i < lines.size(); i++) {
             String line = lines.get(i);
             if (line == null) continue;
             Matcher m = target.matcher(line);
             if (m.find()) {
                 String tail = m.group(2) == null ? "" : m.group(2);
+                if (tail.startsWith("#")) tail = " " + tail;
                 lines.set(i, repeatSpace(indent) + key + ": " + value + tail);
                 return;
             }
@@ -552,7 +437,7 @@ public class ConfigLoader {
         return new Yaml(new SafeConstructor(loaderOptions), representer, dop);
     }
 
-    private String determineConfigDirPath() {
+    private static String determineConfigDirPath() {
         String userConfigPath = System.getProperty("user.home") + File.separator + CONFIG_DIR_NAME;
         if (isValidConfigDir(userConfigPath)) {
             return userConfigPath;
@@ -571,7 +456,7 @@ public class ConfigLoader {
         return f.exists() && f.isDirectory();
     }
 
-    private String getJarConfigPath() {
+    private static String getJarConfigPath() {
         try {
             URL location = Utils.class.getProtectionDomain().getCodeSource().getLocation();
             if (location == null) {

@@ -23,16 +23,121 @@ final class I18nKeys {
     private I18nKeys() {}
 
     static void register() {
+        registerWorkflow();
         registerLabels();
         registerTooltips();
         registerStatus();
         registerDialogs();
         registerConfig();
+        registerRemainingUi();
+        registerParameterizedUi();
     }
 
     // =========================================================
     // 按钮 / 行标签 / Section / Tab / 普通 Label
     // =========================================================
+    private static void registerWorkflow() {
+        I18n.put("baseline.checking", "基线检查中：%s", "Checking baseline: %s");
+        I18n.put("baseline.same", "基线：本次状态与正文一致", "Baseline: same status and body this time");
+        I18n.put("baseline.changed", "基线有变化，需复核", "Baseline changed; review needed");
+        I18n.put("baseline.unknown", "基线：正文无法比较", "Baseline: body comparison unavailable");
+        I18n.put("baseline.no_reference", "基线已重发；缺少同条件响应，无法判断稳定性", "Baseline replayed; no matching reference to assess stability");
+        I18n.put("baseline.metrics", "状态 %s → %s · 响应 %d → %dB · 正文相似度 %s", "Status %s -> %s · %d -> %dB · Body similarity %s");
+        I18n.put("baseline.location_changed", "跳转目标变化", "Redirect target changed");
+        I18n.put("baseline.type_changed", "响应类型变化", "Content type changed");
+        I18n.put("baseline.final", "跟随跳转后的基线：%d / %dB", "Baseline after redirects: %d / %dB");
+        I18n.put("baseline.not_checked", "基线未重发；先点击“重发原请求”", "Baseline not replayed; click Replay Original first");
+        I18n.put("baseline.failed", "基线重发失败，未更新有效基线", "Baseline replay failed; no valid baseline updated");
+        I18n.put("baseline.updated", "基线已更新；当前响应早于此次重发，请重新发送后比较", "Baseline updated; current response predates this replay. Resend to compare");
+        I18n.put("baseline.conditions_changed", "网络目标、发送方式或跳转设置已变化；请重发原请求", "Target, sender or redirect settings changed; replay original");
+        I18n.put("baseline.compare", "对比重发基线：%s", "Baseline comparison: %s");
+        I18n.put("baseline.raw_comparison", "发送条件变化：基线为 Burp，变体为 Raw 且不跟随跳转；需复核", "Conditions changed: Burp baseline vs Raw variant without redirects; review needed");
+        I18n.put("dashboard.baselines", "基线", "Baselines");
+        I18n.put("manual.replay_original", "重发原请求", "Replay Original");
+        I18n.put("manual.replay_original.tip", "按当前网络目标和发送设置重发载入的原请求，保留编辑器中的变体。一次重发只提供本次对比证据。", "Replay the loaded original with current target and send settings, preserving editor changes. One replay provides comparison evidence only.");
+        I18n.put("manual.restore_original", "恢复原请求", "Restore Original");
+        I18n.put("manual.response.baseline", "基线响应", "Baseline response");
+        I18n.put("manual.response.latest", "当前响应", "Current response");
+        I18n.put("manual.request.empty_short", "未载入请求", "No request loaded");
+        I18n.put("manual.response.none_short", "尚无响应", "No response");
+        I18n.put("manual.response.current_short", "本次发送或载入的响应", "Sent or loaded response");
+        I18n.put("manual.response.previous_short", "响应属于此前版本；编辑器已修改", "Response for previously sent version");
+        I18n.put("manual.steps", "变换：%s", "Transformations: %s");
+        I18n.put("manual.steps.tip", "建议：重发原请求 → 恢复原请求 → 应用一个变换 → Send → 对比基线。组合变换会显示操作顺序；配套 Header/长度调整属于同一变换。", "Suggested: Replay Original -> Restore Original -> apply one transformation -> Send -> compare baseline. Combined transformations show their order; related header/length updates belong to the same transformation.");
+        I18n.put("manual.steps.edit", "手动编辑", "Manual edit");
+        I18n.put("manual.steps.original", "原请求", "Original request");
+        I18n.put("auto.changes", "从原请求生成 · %s", "Generated from original · %s");
+        I18n.put("parser.preview", "最近一次 Parser 模型预览", "Last parser model preview");
+        I18n.put("parser.local_model", "仅本地模型；目标解析行为需验证", "Local model only; verify the target parser");
+        I18n.put("manual.text_failed", "文本转换失败，请检查字符集；已保留请求", "Text conversion failed; check the charset. Request retained");
+        I18n.put("manual.body_encoded", "已跳过正文转换：须先处理传输编码或内容编码", "Body conversion skipped: decode transfer/content encoding first");
+        I18n.put("dialog.body_nested_json", "正文转换仅支持扁平 JSON，嵌套对象或数组无法转换；已保留请求。", "Body conversion supports flat JSON only; nested objects or arrays cannot be converted. Request retained.");
+        I18n.put("dialog.body_file_conversion", "正文包含文件字段，无法转换为文本参数；已保留请求。", "The body contains file parts and cannot be converted to text parameters. Request retained.");
+        I18n.put("dashboard.planned", "计划:", "Planned:");
+        I18n.put("dashboard.completed", "完成:", "Done:");
+        I18n.put("dashboard.prepare_failed", "请求准备失败：%s", "Could not prepare requests: %s");
+        I18n.put("manual.selection.required", "请先在请求编辑器中选中文本", "Select text in the request editor first");
+        I18n.put("manual.response.not_sent", "尚无响应；点击 Send 发送已载入的请求", "No response yet; click Send to send the loaded request");
+        I18n.put("config.reload_failed", "配置无效，已保留当前有效规则和输入。", "Invalid configuration; current rules and inputs were retained.");
+        I18n.put("config.reloaded", "已重新加载配置。", "Configuration reloaded.");
+        I18n.put("redirect.cross_origin", "目标主机、端口或协议不同，未自动跟随", "Different host, port or protocol; redirect not followed");
+        I18n.put("redirect.limit", "已达到跳转上限", "Redirect limit reached");
+        I18n.put("redirect.loop", "检测到重复跳转", "Redirect loop detected");
+        I18n.put("redirect.stopped", "跳转停止：%s", "Redirect stopped: %s");
+        I18n.put("manual.response.empty", "尚无响应；从 Burp 右键发送请求到 Manual WAF", "No response; send a request here from the Burp context menu");
+        I18n.put("manual.response.current", "响应对应本次发送/载入的请求；跳转详情见提示", "Response for the sent/loaded request; hover for redirect details");
+        I18n.put("manual.response.previous", "编辑器已修改；响应对应此前发送的版本", "Editor changed; response belongs to the previously sent version");
+        I18n.put("manual.response.waiting", "等待响应：%s | %d 字节 | %s", "Waiting: %s | %d bytes | %s");
+        I18n.put("manual.history.toggle", "显示 History", "Show History");
+        I18n.put("manual.history.hint", "双击载入完整请求、响应和网络目标", "Double-click to load request, response and network target");
+        I18n.put("manual.history.short_hint", "双击载入", "Double-click to load");
+        I18n.put("history.sender", "通道", "Sender");
+        I18n.put("history.method", "方法", "Method");
+        I18n.put("history.path", "路径", "Path");
+        I18n.put("history.status", "状态", "Status");
+        I18n.put("history.length", "长度", "Length");
+        I18n.put("history.duration", "耗时(ms)", "Time(ms)");
+        I18n.put("history.clock", "时间", "Clock");
+        I18n.put("history.target", "网络目标", "Target");
+        I18n.put("manual.history.selected", "已选历史 #%d · %s；双击载入", "History #%d selected · %s; double-click to load");
+        I18n.put("manual.history.no_target", "该历史缺少网络目标，无法安全重放", "History has no network target; cannot replay");
+        I18n.put("manual.scope.none", "无选区 · 范围按工具提示", "No selection · scope follows tool tooltip");
+        I18n.put("manual.scope.selection", "当前选区：%d 字节", "Selection: %d bytes");
+        I18n.put("manual.network_target", "网络目标 Host:", "Network Host:");
+        I18n.put("manual.redirect.raw", "Raw Socket 不支持自动跳转；保留原始请求字节", "Raw Socket does not follow redirects; original request bytes are preserved");
+        I18n.put("manual.redirect.same_origin", "仅跟随相同主机、端口和协议的跳转", "Follow redirects only within the same host, port and protocol");
+        I18n.put("manual.cancel.detached", "已取消本次等待；底层请求可能仍在结束，晚到结果会被忽略", "Wait cancelled; transport may still finish, late results will be ignored");
+        I18n.put("manual.mutation", "%s · %d → %d 字节 · 可撤销", "%s · %d → %d bytes · Undo available");
+        I18n.put("manual.sending.elapsed", "发送中 · 已等待 %d 秒", "Sending · %d seconds elapsed");
+        I18n.put("manual.replace.confirm", "当前请求有未发送修改。是否替换？选择“否”保留当前请求。", "This request has unsent edits. Replace it? Choose No to keep the current request.");
+        I18n.put("manual.port_range", "端口必须为 1–65535", "Port must be between 1 and 65535");
+        I18n.put("manual.no_response", "未收到响应", "No response received");
+        I18n.put("manual.loaded", "已载入：%s", "Loaded: %s");
+        I18n.put("diff.no_original", "无原始请求", "original unavailable");
+        I18n.put("diff.unchanged", "未变化", "unchanged");
+        I18n.put("diff.line", "请求行已变化", "request line changed");
+        I18n.put("diff.headers", "Headers 已变化", "headers changed");
+        I18n.put("diff.body", "Body 已变化（%d → %d 字节）", "body changed (%d -> %d bytes)");
+        I18n.put("dashboard.active", "执行中:", "Active:");
+        I18n.put("dashboard.cancelled", "取消:", "Cancelled:");
+        I18n.put("dashboard.stop", "Stop", "Stop");
+        I18n.put("dashboard.clear", "Clear", "Clear");
+        I18n.put("dashboard.stop.tip", "关闭 AutoScan、取消排队任务并忽略本轮晚到结果；底层请求可能仍在结束", "Disable AutoScan, cancel queued work and ignore late results; active transports may still finish");
+        I18n.put("dashboard.clear.tip", "停止本轮并清空结果与计数", "Stop the current run and clear results and counters");
+        I18n.put("dashboard.stopped", "已停止本轮；取消的请求不会再写入结果。底层请求可能仍在结束。", "Run stopped; cancelled requests cannot add results. Active transports may still finish.");
+        I18n.put("dashboard.listening", "AutoScan 监听中：仅处理新经过 Proxy 的 401/403 响应；取消勾选只停止接收新流量。", "AutoScan listening: new Proxy 401/403 responses only; uncheck to stop accepting new traffic.");
+        I18n.put("dashboard.idle", "AutoScan 未开启。可开启监听，或从 Burp 右键发送到 BypassPro。", "AutoScan is off. Enable it or send requests from the Burp context menu.");
+        I18n.put("dashboard.autoscan.tip", "控制新流量监听；停止已排队任务请使用 Stop", "Controls new traffic; use Stop to cancel queued work");
+        I18n.put("dashboard.threads.tip", "1–100；当前队列排空后应用新的并发上限，Manual WAF 独立发送", "1–100; a new concurrency limit applies after current work drains; Manual WAF sends separately");
+        I18n.put("dashboard.queue_full", "待处理输入已满，本次输入未入队；等待队列排空后可手动重试。", "Input queue is full; this input was not queued. Retry manually after it drains.");
+        I18n.put("dashboard.signals", "信号与错误", "Signals + errors");
+        I18n.put("dashboard.all", "全部结果", "All results");
+        I18n.put("dashboard.errors", "错误", "Errors");
+        I18n.put("dashboard.filtered", "已过滤", "Filtered");
+        I18n.put("dashboard.search", "搜索 URL / 原因:", "Search URL / reason:");
+        I18n.put("dashboard.retained", "保留 %d 条（上限 5000），已移除最早 %d 条", "Retained %d (limit 5000); %d oldest removed");
+    }
+
     private static void registerLabels() {
         // ---- Top-level UI ----
         I18n.put("label.host", "Host:", "Host:");
@@ -432,8 +537,8 @@ final class I18nKeys {
                 "添加或覆盖 X-Original-URL\n用于 IIS/反代/重写链路中的原始 URL 解析差异测试",
                 "Add or overwrite X-Original-URL\nFor IIS / reverse proxy / rewrite original-URL parser diff tests");
 
-        I18n.put("tooltip.http10.title", "HTTP/1.0", "HTTP/1.0");
-        I18n.put("tooltip.http10.desc",
+        I18n.put("tooltip.http_10.title", "HTTP/1.0", "HTTP/1.0");
+        I18n.put("tooltip.http_10.desc",
                 "把请求行协议版本改为 HTTP/1.0\n用于代理、连接复用、Host/TE 处理差异测试",
                 "Change request-line protocol to HTTP/1.0\nFor proxy / keep-alive / Host & TE handling diffs");
 
@@ -682,5 +787,501 @@ final class I18nKeys {
         I18n.put("config.lang.restart_hint",
                 "语言已切换，请重启 Burp 或重新加载插件以使所有界面更新。",
                 "Language switched. Reload the extension or restart Burp to refresh all UI.");
+    }
+
+    private static void registerRemainingUi() {
+        I18n.put("tooltip.default.desc",
+                "点击后对当前请求执行该变换\n有选区的功能通常优先处理选区，没选区则按该按钮的默认范围处理",
+                "Apply this transformation to the current request.\nSelection-based tools use the selected text; otherwise each tool uses its default scope.");
+        I18n.put("tooltip.atom.%00",
+                "URL 编码的 NUL 字节\n常用于截断、解析差异、后缀绕过测试\n位置由上方“Noise 作用方式”决定",
+                "URL-encoded NUL byte\nFor truncation, parser differences and suffix bypass tests\nPlacement is controlled by Noise placement above");
+        I18n.put("tooltip.atom.%09",
+                "URL 编码的 Tab 制表符\n常用于空白字符混淆、关键字分隔、路径解析差异\n位置由上方“Noise 作用方式”决定",
+                "URL-encoded tab\nFor whitespace obfuscation, keyword splitting and path parsing differences\nPlacement is controlled by Noise placement above");
+        I18n.put("tooltip.atom.%0a",
+                "URL 编码的 LF 换行\n常用于 CRLF、Header 注入、协议边界测试\n位置由上方“Noise 作用方式”决定",
+                "URL-encoded LF\nFor CRLF, header injection and protocol boundary tests\nPlacement is controlled by Noise placement above");
+        I18n.put("tooltip.atom.%0d",
+                "URL 编码的 CR 回车\n通常和 %0a 组合测试 CRLF 注入\n位置由上方“Noise 作用方式”决定",
+                "URL-encoded CR\nUsually combined with %0a for CRLF injection tests\nPlacement is controlled by Noise placement above");
+        I18n.put("tooltip.atom.%20",
+                "URL 编码的空格\n常用于关键字分隔、路径空白混淆、参数边界测试\n位置由上方“Noise 作用方式”决定",
+                "URL-encoded space\nFor keyword splitting, path whitespace and parameter boundary tests\nPlacement is controlled by Noise placement above");
+        I18n.put("tooltip.atom.%0b",
+                "URL 编码的 vertical tab\n部分解析器会当空白处理，部分规则不会\n用于空白字符识别差异测试\n位置由上方“Noise 作用方式”决定",
+                "URL-encoded vertical tab\nParsers and filters may disagree on whether this is whitespace\nFor whitespace handling differences\nPlacement is controlled by Noise placement above");
+        I18n.put("tooltip.atom.%0c",
+                "URL 编码的 form feed\n部分解析器会当空白处理，部分规则不会\n用于空白字符识别差异测试\n位置由上方“Noise 作用方式”决定",
+                "URL-encoded form feed\nParsers and filters may disagree on whether this is whitespace\nFor whitespace handling differences\nPlacement is controlled by Noise placement above");
+        I18n.put("tooltip.atom.%a0",
+                "URL 编码的 NBSP 类空白字节\n看起来像空格，但和普通 %20 不同\n用于空白归一化差异测试\n位置由上方“Noise 作用方式”决定",
+                "URL-encoded NBSP-like byte\nLooks like a space but differs from %20\nFor whitespace normalization differences\nPlacement is controlled by Noise placement above");
+        I18n.put("tooltip.atom.%2b",
+                "URL 编码的加号 +\n在 form-urlencoded 中可能被解释为空格\n用于 + / space 解码差异测试\n位置由上方“Noise 作用方式”决定",
+                "URL-encoded plus sign\nMay be interpreted as a space in form-urlencoded data\nFor plus/space decoding differences\nPlacement is controlled by Noise placement above");
+        I18n.put("tooltip.atom./**/",
+                "注释型分隔符\n常用于 SQL 关键字分割、规则匹配绕过\n位置由上方“Noise 作用方式”决定",
+                "Comment separator\nFor SQL keyword splitting and filter matching tests\nPlacement is controlled by Noise placement above");
+        I18n.put("tooltip.atom.generic",
+                "通用噪音原子\n位置由上方“Noise 作用方式”决定",
+                "Generic noise atom\nPlacement is controlled by Noise placement above");
+        I18n.put("tooltip.utf_16.title",
+                "UTF-16",
+                "UTF-16");
+        I18n.put("tooltip.utf_16.desc",
+                "把请求 body 按 UTF-16 重新编码\n同时更新 Content-Type charset 和 Content-Length\n用于 WAF 不识别该字符集、后端能解析的场景",
+                "Re-encode the request body as UTF-16\nUpdate Content-Type charset and Content-Length\nFor cases where the backend understands a charset that the WAF does not");
+        I18n.put("tooltip.utf_16be.title",
+                "UTF-16BE",
+                "UTF-16BE");
+        I18n.put("tooltip.utf_16be.desc",
+                "把请求 body 按 UTF-16BE 重新编码\n同时更新 Content-Type charset 和 Content-Length\n用于 WAF 不识别该字符集、后端能解析的场景",
+                "Re-encode the request body as UTF-16BE\nUpdate Content-Type charset and Content-Length\nFor cases where the backend understands a charset that the WAF does not");
+        I18n.put("tooltip.utf_16le.title",
+                "UTF-16LE",
+                "UTF-16LE");
+        I18n.put("tooltip.utf_16le.desc",
+                "把请求 body 按 UTF-16LE 重新编码\n同时更新 Content-Type charset 和 Content-Length\n用于 WAF 不识别该字符集、后端能解析的场景",
+                "Re-encode the request body as UTF-16LE\nUpdate Content-Type charset and Content-Length\nFor cases where the backend understands a charset that the WAF does not");
+        I18n.put("tooltip.utf_32.title",
+                "UTF-32",
+                "UTF-32");
+        I18n.put("tooltip.utf_32.desc",
+                "把请求 body 按 UTF-32 重新编码\n同时更新 Content-Type charset 和 Content-Length\n用于 WAF 不识别该字符集、后端能解析的场景",
+                "Re-encode the request body as UTF-32\nUpdate Content-Type charset and Content-Length\nFor cases where the backend understands a charset that the WAF does not");
+        I18n.put("tooltip.utf_32be.title",
+                "UTF-32BE",
+                "UTF-32BE");
+        I18n.put("tooltip.utf_32be.desc",
+                "把请求 body 按 UTF-32BE 重新编码\n同时更新 Content-Type charset 和 Content-Length\n用于 WAF 不识别该字符集、后端能解析的场景",
+                "Re-encode the request body as UTF-32BE\nUpdate Content-Type charset and Content-Length\nFor cases where the backend understands a charset that the WAF does not");
+        I18n.put("tooltip.utf_32le.title",
+                "UTF-32LE",
+                "UTF-32LE");
+        I18n.put("tooltip.utf_32le.desc",
+                "把请求 body 按 UTF-32LE 重新编码\n同时更新 Content-Type charset 和 Content-Length\n用于 WAF 不识别该字符集、后端能解析的场景",
+                "Re-encode the request body as UTF-32LE\nUpdate Content-Type charset and Content-Length\nFor cases where the backend understands a charset that the WAF does not");
+        I18n.put("tooltip.ibm037.title",
+                "IBM037",
+                "IBM037");
+        I18n.put("tooltip.ibm037.desc",
+                "把请求 body 按 IBM037 重新编码\n同时更新 Content-Type charset 和 Content-Length\n用于 WAF 不识别该字符集、后端能解析的场景",
+                "Re-encode the request body as IBM037\nUpdate Content-Type charset and Content-Length\nFor cases where the backend understands a charset that the WAF does not");
+        I18n.put("tooltip.cp290.title",
+                "cp290",
+                "cp290");
+        I18n.put("tooltip.cp290.desc",
+                "把请求 body 按 cp290 重新编码\n同时更新 Content-Type charset 和 Content-Length\n用于 WAF 不识别该字符集、后端能解析的场景",
+                "Re-encode the request body as cp290\nUpdate Content-Type charset and Content-Length\nFor cases where the backend understands a charset that the WAF does not");
+        I18n.put("tooltip.2.title",
+                "%2>",
+                "%2>");
+        I18n.put("tooltip.2.desc",
+                "Jetty 非严格 hex 解析案例\n> 经 convertHexDigit 计算可变成 E，%2> 等价 %2E\n这是 parser differential，不是标准 char & 0xFF\n操作: 选中 .、%2e，或包含这些 token 的路径片段",
+                "Jetty loose hex parsing example\nconvertHexDigit can map > to E, making %2> equivalent to %2E\nThis is a parser differential, not standard char & 0xFF\nSelect a dot, %2e, or a path containing these tokens");
+        I18n.put("tooltip.spring_path.title",
+                "Spring Path",
+                "Spring Path");
+        I18n.put("tooltip.spring_path.desc",
+                "替换 request path 为 Spring/Jetty 风格探测路径\n包含 阮严灵丰丰甲来 -> .%u002e 与 %64 URL trigger\n推荐发送: Raw Socket",
+                "Replace the request path with a Spring/Jetty probe path\nIncludes 阮严灵丰丰甲来 -> .%u002e and a %64 URL trigger\nRecommended sender: Raw Socket");
+        I18n.put("tooltip.tomcat_filename.title",
+                "Tomcat filename*",
+                "Tomcat filename*");
+        I18n.put("tooltip.tomcat_filename.desc",
+                "尝试替换 multipart filename/filename* 为 1.陪sp\n低位还原后可能变成 1.jsp\nSpringBoot ContentDisposition 有额外校验，不保证通用",
+                "Try replacing multipart filename/filename* with 1.陪sp\nLow-bit folding may produce 1.jsp\nSpring Boot ContentDisposition adds validation; this is not universally applicable");
+        I18n.put("tooltip.header_crlf.title",
+                "Header CRLF",
+                "Header CRLF");
+        I18n.put("tooltip.header_crlf.desc",
+                "替换选区为 瘍瘊\n低位还原后为 \\r\\n，可用于 header value 断行测试\n推荐发送: Raw Socket\n操作: 先选中 header value 中要替换的位置",
+                "Replace the selection with 瘍瘊\nFolds to \\r\\n for header line-break tests\nRecommended sender: Raw Socket\nSelect the position to replace in a header value first");
+        I18n.put("manual.send.auto_tip",
+                "Send (Auto: 含非 ASCII -> Raw, 否则 Burp)",
+                "Send (Auto: non-ASCII request line/headers -> Raw; otherwise Burp)");
+        I18n.put("manual.send.choose_mode",
+                "选择发送模式",
+                "Choose sending mode");
+        I18n.put("manual.undo",
+                "撤销",
+                "Undo");
+        I18n.put("manual.redo",
+                "恢复",
+                "Redo");
+        I18n.put("manual.reset",
+                "恢复到原始请求",
+                "Restore the original request");
+        I18n.put("manual.follow_redirect",
+                "自动跟随 301/302/303/307/308 跳转",
+                "Follow 301/302/303/307/308 redirects");
+        I18n.put("manual.send.auto",
+                "Auto (含非 ASCII -> Raw)",
+                "Auto (non-ASCII request line/headers -> Raw)");
+        I18n.put("manual.send.raw_hint",
+                "Raw 模式直连目标，不走 Burp 上游代理，禁用证书校验（CTF/测试）",
+                "Raw connects directly, bypasses Burp upstream proxies, and disables certificate verification (CTF/testing)");
+        I18n.put("manual.history.load",
+                "加载请求到编辑器",
+                "Load request into editor");
+        I18n.put("manual.history.delete",
+                "删除此记录",
+                "Delete this entry");
+        I18n.put("dialog.path_no_target",
+                "当前 path 没有可变换的内容，请先选中目标片段",
+                "The path has no matching content. Select the target text first.");
+        I18n.put("dialog.request_empty",
+                "请求为空",
+                "The request is empty.");
+        I18n.put("dialog.request_content_empty",
+                "请求内容为空",
+                "The request is empty.");
+        I18n.put("dialog.request_line_missing",
+                "未识别请求行",
+                "Could not identify the request line.");
+        I18n.put("dialog.path_not_found",
+                "请求行格式不规范，无法定位 path",
+                "Cannot locate the path in this malformed request line.");
+        I18n.put("dialog.content_type_missing",
+                "当前请求没有 Content-Type",
+                "The request has no Content-Type header.");
+        I18n.put("dialog.content_type_invalid",
+                "Content-Type 格式异常",
+                "The Content-Type header is malformed.");
+        I18n.put("dialog.charset_missing",
+                "当前 Content-Type 没有 charset 参数，请先做字符集编码",
+                "Content-Type has no charset parameter. Apply charset encoding first.");
+        I18n.put("dialog.dirty_length",
+                "输入脏数据长度（数字字符数量）:",
+                "Enter the noise length (number of digits):");
+        I18n.put("dialog.positive_number",
+                "请输入大于 0 的数字",
+                "Enter a number greater than 0.");
+        I18n.put("dialog.valid_number",
+                "请输入有效数字",
+                "Enter a valid number.");
+        I18n.put("dialog.null_count",
+                "输入 Null 字节数量:",
+                "Enter the number of null bytes:");
+        I18n.put("dialog.body_empty",
+                "请求体为空",
+                "The request body is empty.");
+        I18n.put("dialog.body_missing",
+                "未找到请求体",
+                "Could not find the request body.");
+        I18n.put("dialog.gzip_already_header",
+                "Header 显示已是 Gzip 格式，取消操作。",
+                "The headers already indicate Gzip encoding. Operation cancelled.");
+        I18n.put("dialog.gzip_confirm",
+                "检测到 Body 似乎已经是 Gzip 格式 (Magic Bytes 1F 8B)。\n是否继续强制压缩？(可能导致双重压缩)",
+                "The body appears to be Gzip data (magic bytes 1F 8B).\nCompress it again? This may cause double compression.");
+        I18n.put("dialog.warning.title",
+                "警告",
+                "Warning");
+        I18n.put("dialog.no_convertible_params",
+                "无法从当前 body 提取可转换的普通参数",
+                "No convertible text parameters were found in the request body.");
+        I18n.put("dialog.multipart_already",
+                "当前请求已是 Multipart 格式",
+                "The request is already in multipart format.");
+        I18n.put("dialog.body_binary",
+                "当前请求体看起来已是二进制/已编码数据，请先恢复原请求，再进行字符集编码",
+                "The request body appears to be binary or already encoded. Use Restore Original before applying charset encoding.");
+        I18n.put("dialog.ghost_select_original",
+                "请先选中要 Ghost 化的原始 payload",
+                "Select the original payload to Ghost-encode first.");
+        I18n.put("dialog.ghost_line_breaks",
+                "当前选区包含换行。该策略可能把 CR/LF 也 Ghost 化，导致 HTTP 请求结构被破坏。\n是否继续？",
+                "The selection contains line breaks. This strategy may Ghost-encode CR/LF and break the HTTP request structure.\nContinue?");
+        I18n.put("dialog.ghost_select_shuffle",
+                "请先选中已 Ghost 化或待 Ghost 化的文本",
+                "Select Ghost-encoded text or text to Ghost-encode first.");
+        I18n.put("ghost.shuffle.before",
+                "换组前: ",
+                "Before shuffle: ");
+        I18n.put("ghost.shuffle.after",
+                "换组后: ",
+                "After shuffle: ");
+        I18n.put("ghost.fold.before",
+                "还原前: ",
+                "Fold before: ");
+        I18n.put("ghost.fold.after",
+                "还原后: ",
+                "Fold after: ");
+        I18n.put("ghost.fold.unchanged",
+                "  (不变)",
+                "  (unchanged)");
+        I18n.put("ghost.fold.changed",
+                "  (! 已改变)",
+                "  (! changed)");
+        I18n.put("dialog.ghost_invalid_utf8",
+                "当前选区不是有效 UTF-8 文本。Gh0st Bits 只处理 ASCII/UTF-8 文本选区，避免破坏二进制 body。",
+                "The selection is not valid UTF-8. Gh0st Bits accepts only ASCII/UTF-8 text to avoid corrupting binary bodies.");
+        I18n.put("dialog.select_replacement",
+                "请先选中要替换的位置",
+                "Select the position to replace first.");
+        I18n.put("dialog.jetty_select",
+                "Jetty %2> 只处理点号 token。请选中 .、%2e，或包含这些 token 的路径片段。",
+                "Jetty %2> handles dot tokens only. Select a dot, %2e, or a path containing these tokens.");
+        I18n.put("dialog.tomcat_select",
+                "请先选中 filename* 中要隐藏的原始字符，例如 j 或 .jsp",
+                "Select the original filename* characters to hide, such as j or .jsp.");
+        I18n.put("dialog.cancel",
+                "取消",
+                "Cancel");
+        I18n.put("dialog.encode_original",
+                "继续按原文编码",
+                "Encode original text");
+        I18n.put("dialog.select_parser",
+                "请先选中要处理的解析差异片段",
+                "Select the text to apply the parser transformation to.");
+        I18n.put("dialog.select_ascii",
+                "请先选中一个 ASCII 字符（如 . / % / @ / \\r / \\n）",
+                "Select one ASCII character, such as . / % / @ / \\r / \\n.");
+        I18n.put("ghost.character",
+                "字符: ",
+                "Character: ");
+        I18n.put("ghost.mode",
+                "模式: ",
+                "Mode: ");
+        I18n.put("ghost.original",
+                "原文: ",
+                "Original: ");
+        I18n.put("ghost.restored",
+                "Ghost 还原: ",
+                "Ghost restore: ");
+        I18n.put("dialog.filename_fallback",
+                "未在请求中找到 filename= 段。\n是否回退为「替换当前选中文本」？",
+                "No filename= field was found in the request.\nReplace the currently selected text instead?");
+        I18n.put("dialog.filename_missing.title",
+                "filename 定位失败",
+                "Filename not found");
+        I18n.put("dialog.header_name",
+                "输入 header 名:",
+                "Enter the header name:");
+        I18n.put("dialog.header_choose",
+                "选择要替换 value 的 header:",
+                "Choose the header whose value should be replaced:");
+        I18n.put("dialog.ghost_select_preview",
+                "请先选中要预览的 Gh0st Bits 文本",
+                "Select the Gh0st Bits text to preview first.");
+        I18n.put("dialog.select_transform",
+                "请先选中要变换的文本",
+                "Select the text to transform first.");
+        I18n.put("dialog.host_empty",
+                "Host 不能为空",
+                "Host cannot be empty.");
+        I18n.put("dialog.port_number",
+                "端口号必须是数字",
+                "The port must be a number.");
+        I18n.put("dialog.selection_not_found",
+                "未找到选中文本在请求中的位置",
+                "Could not locate the selected text in the request.");
+        I18n.put("dialog.scope.selection",
+                "选区处",
+                "Selected occurrence");
+        I18n.put("dialog.scope.title",
+                "作用域",
+                "Scope");
+        I18n.put("dialog.selection_changed",
+                "选区位置已变化，未找到可替换内容",
+                "The selection has moved. No matching content was found to replace.");
+        I18n.put("dialog.select_insertion",
+                "请先选中插入位置",
+                "Select the insertion position first.");
+        I18n.put("config.read_only_hint",
+                "  《只读，在 BypassPro-config.yaml 中修改》",
+                "  (read-only; edit BypassPro-config.yaml)");
+        I18n.put("config.read_only_suffix",
+                " (只读)",
+                " (read-only)");
+        I18n.put("tooltip.path.suffix_selection",
+                "选区: 在选区末尾追加 %s",
+                "Selection: append %s");
+        I18n.put("tooltip.path.prefix_selection",
+                "选区: 在选区前加 %s",
+                "Selection: prepend %s");
+        I18n.put("tooltip.path.prefix_default",
+                "无选区: 给每个 path segment 加 %s",
+                "No selection: prefix every path segment with %s");
+        I18n.put("tooltip.path.append_default",
+                "无选区: 给每个 path segment 追加 %s",
+                "No selection: append %s to every path segment");
+        I18n.put("tooltip.path.append_end",
+                "无选区: 追加到 request path 末尾",
+                "No selection: append to the request path");
+        I18n.put("tooltip.path.standard_traversal",
+                "用途: 绕过只匹配标准 ../ 的规则",
+                "Purpose: test filters that only match standard ../");
+        I18n.put("tooltip.path.double_decode",
+                "用途: 双重 URL decode 后恢复 /",
+                "Purpose: restore / after double URL decoding");
+        I18n.put("tooltip.path.overlong",
+                "用途: 历史 overlong UTF-8 slash 绕过思路",
+                "Purpose: test legacy overlong UTF-8 slash handling");
+        I18n.put("tooltip.path.static_suffix",
+                "用途: 静态资源伪装",
+                "Purpose: disguise the path as a static resource");
+        I18n.put("tooltip.path.semicolon_static",
+                "用途: 分号路径参数 + 静态资源伪装",
+                "Purpose: combine semicolon path parameters with a static resource suffix");
+        I18n.put("tooltip.path.normalization",
+                "用途: 路径规范化差异",
+                "Purpose: test path normalization differences");
+        I18n.put("tooltip.path.query_boundary",
+                "用途: query 边界混淆",
+                "Purpose: test query boundary handling");
+        I18n.put("tooltip.path.double_slash",
+                "用途: 双斜杠规范化 / path collapse 差异",
+                "Purpose: test double-slash normalization and path collapse");
+        I18n.put("tooltip.path.current_directory",
+                "用途: 当前目录规范化差异",
+                "Purpose: test current-directory normalization");
+        I18n.put("tooltip.path.encoded_directory",
+                "用途: 编码当前目录规范化差异",
+                "Purpose: test encoded current-directory normalization");
+        I18n.put("tooltip.path.semicolon_segment",
+                "用途: 分号路径参数 / segment 解析差异",
+                "Purpose: test semicolon path parameters and segment parsing");
+        I18n.put("tooltip.path.dot_semicolon",
+                "用途: 点 + 分号组合解析差异",
+                "Purpose: test combined dot and semicolon parsing");
+        I18n.put("tooltip.path.encoded_dot",
+                "用途: 编码点前缀",
+                "Purpose: test encoded dot prefixes");
+        I18n.put("tooltip.path.double_encoded_dot",
+                "用途: 双重编码点前缀",
+                "Purpose: test double-encoded dot prefixes");
+        I18n.put("tooltip.path.encoded_backslash",
+                "用途: 编码反斜杠路径差异",
+                "Purpose: test encoded backslash path handling");
+        I18n.put("tooltip.path.matrix_boundary",
+                "用途: 矩阵参数 / 分号边界",
+                "Purpose: test matrix parameters and semicolon boundaries");
+        I18n.put("tooltip.path.dot_semicolon_parse",
+                "用途: 点分号解析差异",
+                "Purpose: test dot-semicolon parsing");
+        I18n.put("tooltip.path.double_dot_semicolon",
+                "用途: 点点分号解析差异",
+                "Purpose: test double-dot-semicolon parsing");
+        I18n.put("tooltip.path.matrix_params",
+                "用途: 矩阵参数混淆",
+                "Purpose: test matrix parameter handling");
+        I18n.put("tooltip.path.java_session",
+                "用途: Java session path 参数",
+                "Purpose: test Java session path parameters");
+        I18n.put("tooltip.path.semicolon_params",
+                "用途: 泛化 matrix param / 分号参数解析差异",
+                "Purpose: test matrix and semicolon parameter parsing");
+    }
+
+    // 模板原文也可作为 key：仅匹配内置说明，保留用户自定义文本。
+    private static void registerParameterizedUi() {
+        I18n.put("dialog.error.gzip",
+                "Gzip 错误: %s",
+                "Gzip error: %s");
+        I18n.put("dialog.error.form",
+                "Form 转换错误: %s",
+                "Form conversion error: %s");
+        I18n.put("dialog.error.multipart",
+                "Multipart 转换错误: %s",
+                "Multipart conversion error: %s");
+        I18n.put("dialog.error.json",
+                "JSON 转换错误: %s",
+                "JSON conversion error: %s");
+        I18n.put("dialog.error.encoding",
+                "编码错误: %s",
+                "Encoding error: %s");
+        I18n.put("dialog.force_url_encode",
+                "当前选区按标准 URL 编码后没有变化。\n\n这通常是因为选区只包含字母、数字等 URL 安全字符。\n是否仍然强制把选区每个原始字节编码成 %XX？",
+                "Standard URL encoding did not change the selection.\n\nIt may contain only URL-safe characters such as letters and digits.\nEncode every selected byte as %XX anyway?");
+        I18n.put("dialog.force_path_encode",
+                "当前选区按 Path 编码后没有变化。\n\n这通常是因为选区只包含路径安全字符。\n是否仍然强制把选区每个原始字节编码成 %XX？",
+                "Path encoding did not change the selection.\n\nIt may contain only path-safe characters.\nEncode every selected byte as %XX anyway?");
+        I18n.put("dialog.force_double_encode",
+                "当前选区按双重 URL 编码后没有变化。\n\n这通常是因为选区只包含字母、数字等 URL 安全字符。\n是否仍然强制编码安全字符？例如 d -> %64 -> %2564。",
+                "Double URL encoding did not change the selection.\n\nIt may contain only URL-safe characters such as letters and digits.\nForce encoding of safe characters, for example d -> %64 -> %2564?");
+        I18n.put("dialog.tomcat_hex_input",
+                "Tomcat %%HH 接收原始字符，不接收 hex 字符串。\n例如要隐藏 j，请选中 j；不要选中 6a。\n\n如果继续，工具会把字符 %s 本身逐字节编码。",
+                "Tomcat %%HH expects original characters, not a hex string.\nTo hide j, select j rather than 6a.\n\nContinuing will encode the literal characters %s byte by byte.");
+        I18n.put("dialog.template_empty",
+                "模板 %s 渲染结果为空，请检查 YAML pattern",
+                "Template %s rendered no content. Check its YAML pattern.");
+        I18n.put("dialog.header_missing",
+                "未找到 header: %s",
+                "Header not found: %s");
+        I18n.put("dialog.template_preview",
+                "模板已生成，请先选中要替换的位置（target=%s）后再应用：\n\n%s",
+                "Template generated. Select the position to replace (target=%s), then apply it:\n\n%s");
+        I18n.put("dialog.selection_unchanged",
+                "当前操作对选区没有产生变化。\n\n常见原因：选区字符在该规则下属于安全字符，或已经符合目标形态。",
+                "This operation did not change the selection.\n\nThe selected characters may be safe under this rule or already in the target form.");
+        I18n.put("dialog.scope.all",
+                "全部 (%d 处)",
+                "All (%d matches)");
+        I18n.put("dialog.scope.occurrence",
+                "第 %d 处: ...%s...",
+                "Match %d: ...%s...");
+        I18n.put("dialog.scope.prompt",
+                "请求中有 %d 处匹配，选择作用域：",
+                "Found %d matches in the request. Choose the scope:");
+        I18n.put("template.source",
+                "来自 YAML: profiles.manual_waf_bypass.ghost_bits.templates.%s",
+                "YAML source: profiles.manual_waf_bypass.ghost_bits.templates.%s");
+        I18n.put("template.target",
+                "目标: %s",
+                "Target: %s");
+        I18n.put("template.sender",
+                "发送: %s",
+                "Sender: %s");
+        I18n.put("template.action",
+                "操作: 按模板 target 自动处理；selection 模板需先选中替换位置",
+                "Usage: apply to the template target; select the replacement position first for selection templates");
+        I18n.put("template.notes",
+                "说明: %s",
+                "Notes: %s");
+        I18n.put("Jetty %2> Loose Hex (Openfire 进阶)",
+                "Jetty %2> Loose Hex (Openfire 进阶)",
+                "Jetty %2> Loose Hex (Openfire advanced)");
+        I18n.put("Spring 检查阶段看不到 ../，后续解析阶段低位还原为 .%u002e 并继续解码为 ..",
+                "Spring 检查阶段看不到 ../，后续解析阶段低位还原为 .%u002e 并继续解码为 ..",
+                "Spring validation does not see ../; later parsing folds to .%u002e and decodes it to ..");
+        I18n.put("TypeUtil.convertHexDigit 容错: %2> -> %2E -> .",
+                "TypeUtil.convertHexDigit 容错: %2> -> %2E -> .",
+                "TypeUtil.convertHexDigit loose parsing: %2> -> %2E -> .");
+        I18n.put("RFC2231 multipart filename* 解析差异: 陪 -> j",
+                "RFC2231 multipart filename* 解析差异: 陪 -> j",
+                "RFC2231 multipart filename* parsing difference: 陪 -> j");
+        I18n.put("RFC2231 multipart filename* 解析差异，%HH 中的 H 使用 7-bit Ghost 字符，鸶繡 低 7 位还原为 6a",
+                "RFC2231 multipart filename* 解析差异，%HH 中的 H 使用 7-bit Ghost 字符，鸶繡 低 7 位还原为 6a",
+                "RFC2231 multipart filename* parsing difference: the H characters in %HH use 7-bit Ghost characters; 鸶繡 folds to 6a");
+        I18n.put("(byte) chars[i] 把 char 直接写为 byte",
+                "(byte) chars[i] 把 char 直接写为 byte",
+                "(byte) chars[i] writes a char directly as a byte");
+        I18n.put("\\x 解析表未填充位置按 0 参与计算: \\x4_ -> 0x40 -> @",
+                "\\x 解析表未填充位置按 0 参与计算: \\x4_ -> 0x40 -> @",
+                "Unfilled entries in the \\x parsing table are treated as 0: \\x4_ -> 0x40 -> @");
+        I18n.put("全角 %２ｅ 在多重规范化后还原为 %2e -> .",
+                "全角 %２ｅ 在多重规范化后还原为 %2e -> .",
+                "Fullwidth %２ｅ normalizes to %2e -> . after multiple normalization steps");
+        I18n.put("\\u 转义 hex 解析使用 Character.digit(): Arabic-Indic ٠٠٤٠ → 0040 → @。⚠️ 警告：此漏洞基于真实的数字属性，请勿对其使用“换组”操作！",
+                "\\u 转义 hex 解析使用 Character.digit(): Arabic-Indic ٠٠٤٠ → 0040 → @。⚠️ 警告：此漏洞基于真实的数字属性，请勿对其使用“换组”操作！",
+                "\\u hex parsing uses Character.digit(): Arabic-Indic ٠٠٤٠ -> 0040 -> @. Warning: this relies on actual digit properties. Do not use Shuffle!");
+        I18n.put("Jackson ReaderBasedJsonParser 的 charToHex(ch & 255): Ghost 化 \\u0040 的 4 个 hex 位，低位还原后仍为 @type；SpringBoot 默认 UTF8StreamJsonParser 通常不触发",
+                "Jackson ReaderBasedJsonParser 的 charToHex(ch & 255): Ghost 化 \\u0040 的 4 个 hex 位，低位还原后仍为 @type；SpringBoot 默认 UTF8StreamJsonParser 通常不触发",
+                "Jackson ReaderBasedJsonParser charToHex(ch & 255): Ghost-encode the four hex digits in \\u0040 to restore @type after folding. The default Spring Boot UTF8StreamJsonParser is usually unaffected.");
+        I18n.put("$$BCEL$$ 前缀必须保持字面量；真正 Ghost 化的是后续 gzip/class encoded bytes，本模板只插入前缀",
+                "$$BCEL$$ 前缀必须保持字面量；真正 Ghost 化的是后续 gzip/class encoded bytes，本模板只插入前缀",
+                "Keep the $$BCEL$$ prefix literal. Ghost encoding applies to the following gzip/class encoded bytes. This template inserts only the prefix.");
+        I18n.put("Integer.parseInt() 接受 Unicode 数字变体（如 Arabic-Indic ٢）：%٢e%٢e -> %2e%2e -> .. ⚠️ 警告：此漏洞基于真实的数字属性，请勿对其使用“换组”操作！",
+                "Integer.parseInt() 接受 Unicode 数字变体（如 Arabic-Indic ٢）：%٢e%٢e -> %2e%2e -> .. ⚠️ 警告：此漏洞基于真实的数字属性，请勿对其使用“换组”操作！",
+                "Integer.parseInt() accepts Unicode digits such as Arabic-Indic ٢: %٢e%٢e -> %2e%2e -> .. Warning: this relies on actual digit properties. Do not use Shuffle!");
+        I18n.put("inspector.empty_payload",
+                "空 payload",
+                "Empty payload");
+        I18n.put("inspector.custom_payload",
+                "自定义 payload",
+                "Custom payload");
     }
 }

@@ -1,0 +1,3 @@
+interface:
+  display_name: "Web 绕过研究方法论"
+  short_description: "从第一性原理和底层关系推导 Web 绕过候选，持续多轮执行与复验"

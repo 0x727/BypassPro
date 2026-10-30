@@ -34,7 +34,7 @@ public class DiffPage {
      * @return String
      */
     public static String getFilteredPageContent(String htmlStr) {
-        htmlStr = capForNormalization(htmlStr);
+        if (htmlStr == null) return "";
         // 将实体字符串转义返回 如: "&lt;"="<", "&gt;"=">", "&quot;"="\"", "&nbsp;"=" ", "&amp;"="&"
         htmlStr = htmlStr.replace("&lt;", "<");
         htmlStr = htmlStr.replace("&gt;", ">");
@@ -67,7 +67,7 @@ public class DiffPage {
         // 过滤空格等
         htmlStr = htmlStr.replaceAll(spaceRegex, "");
 
-        return htmlStr.trim();
+        return sampleForCompare(htmlStr.trim());
     }
 
     private static String normalizeForCompare(String body, String contentType) {
@@ -76,7 +76,7 @@ public class DiffPage {
         }
 
         String ct = contentType == null ? "" : contentType.toLowerCase();
-        String s = capForNormalization(body);
+        String s = body;
 
         if (looksLikeJson(ct, s)) {
             s = normalizeJsonText(s);
@@ -87,20 +87,21 @@ public class DiffPage {
         }
 
         s = normalizeDynamicTokens(s);
-        if (s.length() > MAX_COMPARE_LEN) {
-            s = s.substring(0, MAX_COMPARE_LEN);
-        }
-        return s;
+        return sampleForCompare(s);
     }
 
-    private static String capForNormalization(String s) {
-        if (s == null) {
-            return "";
-        }
+    private static String sampleForCompare(String s) {
         if (s.length() <= MAX_COMPARE_LEN) {
             return s;
         }
-        return s.substring(0, MAX_COMPARE_LEN);
+        // 取分布在全文中的四段，保留局部结构并限制比较成本。
+        int chunk = MAX_COMPARE_LEN / 4;
+        StringBuilder sample = new StringBuilder(MAX_COMPARE_LEN);
+        for (int i = 0; i < 4; i++) {
+            int start = (int)((long)(s.length() - chunk) * i / 3);
+            sample.append(s, start, start + chunk);
+        }
+        return sample.toString();
     }
 
     private static boolean looksLikeJson(String contentType, String body) {
@@ -151,10 +152,23 @@ public class DiffPage {
         if (json == null) {
             return "";
         }
-        // 不引入额外依赖：先做稳定化（去空白 + 通用动态替换在后续统一做）
-        String s = json.trim();
-        s = s.replaceAll("\\s+", "");
-        return s;
+        StringBuilder out = new StringBuilder(json.length());
+        boolean inString = false, escaped = false;
+        for (int i = 0; i < json.length(); i++) {
+            char c = json.charAt(i);
+            if (inString) {
+                out.append(c);
+                if (escaped) escaped = false;
+                else if (c == '\\') escaped = true;
+                else if (c == '"') inString = false;
+            } else if (c == '"') {
+                inString = true;
+                out.append(c);
+            } else if (c != ' ' && c != '\t' && c != '\r' && c != '\n') {
+                out.append(c);
+            }
+        }
+        return out.toString();
     }
 
     private static String normalizePlainText(String text) {
@@ -204,8 +218,8 @@ public class DiffPage {
         }
         java.util.HashSet<Integer> sa = new java.util.HashSet<>();
         java.util.HashSet<Integer> sb = new java.util.HashSet<>();
-        int limitA = Math.min(a.length() - n + 1, 4000);
-        int limitB = Math.min(b.length() - n + 1, 4000);
+        int limitA = a.length() - n + 1;
+        int limitB = b.length() - n + 1;
         for (int i = 0; i < limitA; i++) {
             sa.add(a.substring(i, i + n).hashCode());
         }

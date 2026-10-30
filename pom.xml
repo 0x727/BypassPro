@@ -6,7 +6,7 @@
 
     <groupId>com.Bypass</groupId>
     <artifactId>BypassPro</artifactId>
-    <version>5.1</version>
+    <version>5.2</version>
     <packaging>jar</packaging>
 
     <dependencies>

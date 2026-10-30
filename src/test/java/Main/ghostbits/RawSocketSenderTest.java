@@ -27,6 +27,29 @@ import static org.junit.Assert.fail;
  * 不能是已经折叠后的 .%u002e (2E 25 75 30 30 32 65)，也不能是 percent-encoding。
  */
 public class RawSocketSenderTest {
+    @Test public void tlsHandshakeUsesReadTimeoutAndClosesFailedSocket() throws Exception {
+        try (ServerSocket listener = new ServerSocket(0, 1, java.net.InetAddress.getByName("127.0.0.1"))) {
+            java.util.concurrent.CountDownLatch closed = new java.util.concurrent.CountDownLatch(1);
+            Thread peer = new Thread(() -> {
+                try (Socket connection = listener.accept()) {
+                    connection.setSoTimeout(2000);
+                    byte[] data = new byte[8192];
+                    while (connection.getInputStream().read(data) >= 0) { }
+                    closed.countDown();
+                } catch (IOException ignored) { }
+            });
+            peer.setDaemon(true); peer.start();
+            long start = System.currentTimeMillis();
+            try {
+                new RawSocketSender().send("127.0.0.1", listener.getLocalPort(), true,
+                        "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n".getBytes(StandardCharsets.ISO_8859_1), 1000, 150);
+                fail("TLS peer that never replies must time out");
+            } catch (IOException expected) {
+                assertTrue(System.currentTimeMillis() - start < 2000);
+                assertTrue("failed TLS connection leaked", closed.await(2, java.util.concurrent.TimeUnit.SECONDS));
+            } finally { peer.join(2500); }
+        }
+    }
 
     private static EchoServer server;
 

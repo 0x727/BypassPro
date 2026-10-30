@@ -15,6 +15,34 @@ import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 
 public class AutoGhostBitsGeneratorTest {
+    @Test public void chunkedBodyIsSkippedWhileTargetAndQueryCandidatesRemain() {
+        Map<String, Object> local = new LinkedHashMap<>(options);
+        Map<String, Object> generic = new LinkedHashMap<>();
+        generic.put("enabled", true); generic.put("variant_count", 1);
+        generic.put("strategies", java.util.Collections.singletonMap("minimal", true));
+        local.put("generic", generic);
+        byte[] request = ("POST /x?name=%2e HTTP/1.1\r\nHost: h.test\r\nContent-Type: application/json\r\n"
+                + "Transfer-Encoding: chunked\r\n\r\nb\r\n{\"k\":\"../\"}\r\n0\r\n\r\n").getBytes(StandardCharsets.UTF_8);
+        List<GhostBitsAutoVariant> variants = new AutoGhostBitsGenerator(rule, local).generate(request);
+        assertFalse(variants.isEmpty());
+        for (GhostBitsAutoVariant variant : variants) {
+            assertTrue(variant.getTarget().equals("target") || variant.getTarget().equals("query"));
+            String wire = new String(variant.getRequestBytes(), StandardCharsets.UTF_8);
+            assertEquals(new String(request, StandardCharsets.UTF_8).split("\r\n\r\n", 2)[1], wire.split("\r\n\r\n", 2)[1]);
+            assertFalse(wire.contains("Content-Length:"));
+        }
+    }
+
+    @Test public void compressedBodyAndChunkedFilenameAreNotEditedAsPlainText() {
+        Map<String, Object> local = new LinkedHashMap<>(options);
+        local.put("templates", java.util.Collections.singletonMap("tomcat_jsp_upload", true));
+        byte[] request = ("POST /x HTTP/1.1\r\nHost: h.test\r\nContent-Type: multipart/form-data; boundary=b\r\n"
+                + "Transfer-Encoding: chunked\r\n\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.jsp\"\r\n").getBytes(StandardCharsets.UTF_8);
+        assertTrue(new AutoGhostBitsGenerator(rule, local).generate(request).isEmpty());
+        byte[] encoded = ("POST /x HTTP/1.1\r\nHost: h.test\r\nContent-Type: application/json\r\nContent-Encoding: gzip\r\n\r\n"
+                + "{\"value\":\"%2e../\"}").getBytes(StandardCharsets.UTF_8);
+        assertTrue(new AutoGhostBitsGenerator(rule, options).generate(encoded).isEmpty());
+    }
 
     private GhostBitsRule rule;
     private Map<String, Object> options;

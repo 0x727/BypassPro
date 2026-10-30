@@ -1,7 +1,11 @@
 package Main.ghostbits;
 
 import Main.Utils;
+import Main.RequestBodyPolicy;
+import Main.TextCodec;
 
+import java.nio.charset.Charset;
+import java.nio.charset.CharacterCodingException;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -142,7 +146,7 @@ public class AutoGhostBitsGenerator {
                                       List<GhostBitsAutoVariant> result,
                                       int maxVariants,
                                       boolean rawSocketEnabled) {
-        TextRange body = extractUtf8Body(originalRequest);
+        TextRange body = extractTextBody(originalRequest);
         if (body == null || body.text.isEmpty()) {
             return;
         }
@@ -150,8 +154,9 @@ public class AutoGhostBitsGenerator {
         if (mutation == null || mutation.value.equals(body.text)) {
             return;
         }
-        byte[] replaced = replaceRange(originalRequest, body.start, body.end,
-                mutation.value.getBytes(StandardCharsets.UTF_8));
+        byte[] encoded = encodeBodyMutation(body, mutation.value);
+        if (encoded == null) return;
+        byte[] replaced = replaceRange(originalRequest, body.start, body.end, encoded);
         byte[] mutated = updateContentLength(replaced);
         if (mutated == null || Arrays.equals(originalRequest, mutated)) {
             return;
@@ -180,12 +185,18 @@ public class AutoGhostBitsGenerator {
         }
 
         Set<String> seen = new LinkedHashSet<>();
-        for (GhostBitsCodec.EncodeStrategy strategy : orderedGenericStrategies(strategies)) {
-            for (int i = 0; i < variantCount && result.size() < maxVariants; i++) {
+        List<GhostBitsCodec.EncodeStrategy> enabledStrategies = orderedGenericStrategies(strategies);
+        for (int i = 0; i < variantCount && result.size() < maxVariants; i++) {
+            for (GhostBitsCodec.EncodeStrategy strategy : enabledStrategies) {
+                if (result.size() >= maxVariants) return;
                 addEquivalentTargetVariant(originalRequest, result, maxVariants, rawSocketEnabled, strategy, seen);
-                if (result.size() >= maxVariants) break;
+            }
+            for (GhostBitsCodec.EncodeStrategy strategy : enabledStrategies) {
+                if (result.size() >= maxVariants) return;
                 addEquivalentFilenameVariant(originalRequest, result, maxVariants, rawSocketEnabled, strategy, seen);
-                if (result.size() >= maxVariants) break;
+            }
+            for (GhostBitsCodec.EncodeStrategy strategy : enabledStrategies) {
+                if (result.size() >= maxVariants) return;
                 addEquivalentBodyVariant(originalRequest, result, maxVariants, rawSocketEnabled, strategy, seen);
             }
         }
@@ -259,7 +270,7 @@ public class AutoGhostBitsGenerator {
                                           boolean rawSocketEnabled,
                                           GhostBitsCodec.EncodeStrategy strategy,
                                           Set<String> seen) {
-        TextRange body = extractUtf8Body(originalRequest);
+        TextRange body = extractTextBody(originalRequest);
         if (body == null || body.text.isEmpty()) {
             return;
         }
@@ -275,8 +286,9 @@ public class AutoGhostBitsGenerator {
                 || !seen.add("body:" + mutation.value)) {
             return;
         }
-        byte[] replaced = replaceRange(originalRequest, body.start, body.end,
-                mutation.value.getBytes(StandardCharsets.UTF_8));
+        byte[] encoded = encodeBodyMutation(body, mutation.value);
+        if (encoded == null) return;
+        byte[] replaced = replaceRange(originalRequest, body.start, body.end, encoded);
         byte[] mutated = updateContentLength(replaced);
         if (mutated == null || Arrays.equals(originalRequest, mutated)) {
             return;
@@ -483,17 +495,28 @@ public class AutoGhostBitsGenerator {
         return m.find() ? m.group(1) : null;
     }
 
-    private TextRange extractUtf8Body(byte[] request) {
+    private TextRange extractTextBody(byte[] request) {
+        if (!RequestBodyPolicy.isEditable(request)) return null;
         int headerEnd = findHeaderEnd(request);
         if (headerEnd < 0 || headerEnd >= request.length) {
             return null;
         }
         byte[] body = Arrays.copyOfRange(request, headerEnd, request.length);
-        String text = new String(body, StandardCharsets.UTF_8);
-        if (!Arrays.equals(text.getBytes(StandardCharsets.UTF_8), body)) {
+        try {
+            Charset charset = RequestBodyPolicy.charset(RequestBodyPolicy.headers(request));
+            return new TextRange(headerEnd, request.length, TextCodec.decode(body, charset), charset);
+        } catch (CharacterCodingException | IllegalArgumentException invalid) {
             return null;
         }
-        return new TextRange(headerEnd, request.length, text);
+    }
+
+    private byte[] encodeBodyMutation(TextRange body, String value) {
+        try {
+            byte[] encoded = TextCodec.encode(value, body.charset);
+            return value.equals(TextCodec.decode(encoded, body.charset)) ? encoded : null;
+        } catch (CharacterCodingException invalid) {
+            return null;
+        }
     }
 
     private String headerValue(byte[] request, String headerName) {
@@ -593,6 +616,7 @@ public class AutoGhostBitsGenerator {
         } else {
             m = PLAIN_FILENAME.matcher(text);
             if (m.find()) {
+                if (m.start() >= findHeaderEnd(request) && !RequestBodyPolicy.isEditable(request)) return null;
                 if (forceRfc2231) {
                     valueStart = m.start();
                     valueEnd = m.end();
@@ -609,6 +633,7 @@ public class AutoGhostBitsGenerator {
         if (valueStart < 0 || valueEnd < valueStart) {
             return null;
         }
+        if (valueStart >= findHeaderEnd(request) && !RequestBodyPolicy.isEditable(request)) return null;
         byte[] replaced = replaceRange(request, valueStart, valueEnd, payload);
         return updateContentLength(replaced);
     }
@@ -846,11 +871,13 @@ public class AutoGhostBitsGenerator {
         final int start;
         final int end;
         final String text;
+        final Charset charset;
 
-        TextRange(int start, int end, String text) {
+        TextRange(int start, int end, String text, Charset charset) {
             this.start = start;
             this.end = end;
             this.text = text == null ? "" : text;
+            this.charset = charset;
         }
     }
 }

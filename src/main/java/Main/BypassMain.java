@@ -13,8 +13,6 @@ import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.charset.Charset;
-import java.nio.charset.CharsetDecoder;
-import java.nio.charset.CodingErrorAction;
 import java.nio.charset.StandardCharsets;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
@@ -22,13 +20,16 @@ import java.net.URL;
 import java.net.URLDecoder;
 import java.util.*;
 import java.util.concurrent.ExecutorService;
+import java.util.concurrent.FutureTask;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.zip.GZIPOutputStream;
 
 public class BypassMain implements IContextMenuFactory, IProxyListener {
 
     private static final int DEFAULT_MAX_REDIRECT_HOPS = 3;
 
-    private static synchronized long nextId() {
+    static synchronized long nextId() {
         return Utils.count++;
     }
 
@@ -47,6 +48,7 @@ public class BypassMain implements IContextMenuFactory, IProxyListener {
         if (path.startsWith("/")) {
             path = path.substring(1);
         }
+        String headerPath = path;
 
         Boolean isEnd = false;
 
@@ -68,7 +70,7 @@ public class BypassMain implements IContextMenuFactory, IProxyListener {
 
         // prefix 规则：对每层目录前置变形
         List<String> prefixList = safeStringList(profileConfig.get("prefix"));
-        if (paths.length > 1) {
+        if (paths.length > 0) {
             int paths_len = paths.length;
             if (isEnd) {
                 allRequests.addAll(makeRequestPrefix(prefixList, paths, paths_len, "/", method));
@@ -85,7 +87,7 @@ public class BypassMain implements IContextMenuFactory, IProxyListener {
 
         // headers 规则：Header 伪造变体
         List<?> headersList = safeList(profileConfig.get("headers"));
-        allRequests.addAll(makeRequestHeader(headersList, path, method));
+        allRequests.addAll(makeRequestHeader(headersList, headerPath, method));
 
         return deduplicateRequests(allRequests);
 
@@ -226,9 +228,11 @@ public class BypassMain implements IContextMenuFactory, IProxyListener {
         private String tool;
         private final boolean followRedirect;
         private final int maxRedirects;
+        private final ScanSession session;
 
         public Run_request(BaseRequest baseRequest, IHttpRequestResponse iHttpRequestResponse, String tool,
-                           boolean followRedirect, int maxRedirects) {
+                           boolean followRedirect, int maxRedirects, ScanSession session) {
+            this.session = session;
             this.baseRequest = baseRequest;
             this.iHttpRequestResponse = iHttpRequestResponse;
             this.tool = tool;
@@ -238,7 +242,8 @@ public class BypassMain implements IContextMenuFactory, IProxyListener {
 
         @Override
         public void run() {
-
+            if (session.cancelled) return;
+            byte[] attempted = iHttpRequestResponse.getRequest();
             String method = baseRequest.method;
             String path = baseRequest.path;
             Map<String, String> headers = baseRequest.headers;
@@ -246,24 +251,21 @@ public class BypassMain implements IContextMenuFactory, IProxyListener {
             try {
                 byte[] oldRequestBytes = iHttpRequestResponse.getRequest();
                 if (oldRequestBytes == null) {
-                    Utils.panel.addErrorRequestNum(1);
-                    return;
+                    throw new IllegalArgumentException("Invalid source request");
                 }
 
                 IRequestInfo requestInfo = Utils.helpers.analyzeRequest(iHttpRequestResponse.getHttpService(),
                         oldRequestBytes);
                 List<String> newHeaders = new ArrayList<>(requestInfo.getHeaders());
                 if (newHeaders.isEmpty()) {
-                    Utils.panel.addErrorRequestNum(1);
-                    return;
+                    throw new IllegalArgumentException("Invalid source request");
                 }
 
                 // 请求行：METHOD path HTTP/x.x
                 String requestLine = newHeaders.get(0);
                 String[] parts = requestLine.split(" ", 3);
                 if (parts.length < 3) {
-                    Utils.panel.addErrorRequestNum(1);
-                    return;
+                    throw new IllegalArgumentException("Invalid source request");
                 }
 
                 String httpVersion = parts[2];
@@ -299,41 +301,40 @@ public class BypassMain implements IContextMenuFactory, IProxyListener {
                 }
                 byte[] newRequestBytes = Utils.helpers.buildHttpMessage(newHeaders, body);
 
+                attempted = newRequestBytes;
                 SendResult sendResult = sendWithRedirectPolicy(iHttpRequestResponse.getHttpService(),
-                        newRequestBytes, followRedirect, maxRedirects);
+                        newRequestBytes, followRedirect, maxRedirects, session);
 
-                byte[] oldResponseBytes = iHttpRequestResponse.getResponse();
                 byte[] finalResponseBytes = sendResult.getJudgedResponseBytes();
+                if (session.cancelled) return;
+                if (finalResponseBytes == null || finalResponseBytes.length == 0)
+                    throw new IllegalStateException(I18n.t("manual.no_response"));
 
-                short oldStatus = getStatusSafe(oldResponseBytes);
-                short newStatus = getStatusSafe(finalResponseBytes);
-                String newMime = getMimeSafe(finalResponseBytes);
-
-                String oldBody = extractBodyAsString(oldResponseBytes);
-                String newBody = extractBodyAsString(finalResponseBytes);
                 double threshold = Utils.panel.getSimilarityThreshold();
-                double ratio = DiffPage.getRatio(oldBody, newBody, newMime);
+                ResponseComparison comparison = new ResponseComparison(iHttpRequestResponse, sendResult.analysis());
+                short oldStatus = comparison.oldStatus;
+                short newStatus = comparison.newStatus;
+                String newBody = comparison.body;
+                double ratio = comparison.ratio;
                 boolean statusClassChanged = (oldStatus > 0 && newStatus > 0) && (oldStatus / 100 != newStatus / 100);
 
-                boolean shouldLog = isCandidateStatus(newStatus) && (ratio < threshold || statusClassChanged);
+                boolean shouldLog = comparison.complete && isCandidateStatus(newStatus) && (ratio < threshold || statusClassChanged);
 
-                // Utils.panel.addFinishRequestNum(1);
-                addFinishRequestNum(1);
-
-                if (sendResult.judgedMessage != null && finalResponseBytes != null && shouldLog) {
-                    String title = Utils.getBodyTitle(new String(finalResponseBytes, "utf-8"));
-                    String reason = buildAutoReason(oldStatus, newStatus, ratio, threshold, statusClassChanged);
-                    addLog(sendResult, title, tool, reason);
+                if (sendResult.judgedMessage != null && finalResponseBytes != null) {
+                    String title = Utils.getBodyTitle(newBody == null ? "" : newBody);
+                    String reason = comparison.reason(buildAutoReason(oldStatus, newStatus, ratio, threshold, statusClassChanged));
+                    reason = candidateReason(iHttpRequestResponse, newRequestBytes, sendResult.analysis(), ratio, reason, false);
+                    addLog(session, sendResult, title, tool, reason, shouldLog);
                 }
+                Utils.panel.addFinishRequestNum(session, 1);
 
-            } catch (Throwable ee) {
-                Utils.panel.addErrorRequestNum(1);
-
+            } catch (Exception ee) {
+                recordFailure(session, iHttpRequestResponse.getHttpService(), attempted, tool, ee);
             }
         }
     }
 
-    private static boolean isCandidateStatus(short statusCode) {
+    static boolean isCandidateStatus(short statusCode) {
         return statusCode == 200 || statusCode == 206 || statusCode == 304
                 || statusCode == 301 || statusCode == 302 || statusCode == 303 || statusCode == 307 || statusCode == 308
                 || statusCode == 405 || statusCode == 415;
@@ -383,62 +384,118 @@ public class BypassMain implements IContextMenuFactory, IProxyListener {
     }
 
     private static short getStatusSafe(byte[] responseBytes) {
-        if (responseBytes == null) {
-            return -1;
-        }
-        try {
-            return Utils.helpers.analyzeResponse(responseBytes).getStatusCode();
-        } catch (Exception e) {
-            return -1;
-        }
+        int code = HttpResponse.analyze(responseBytes, "").statusCode;
+        return (short)(code == 0 ? -1 : code);
     }
 
-    private static String getMimeSafe(byte[] responseBytes) {
-        if (responseBytes == null) {
-            return "";
+    private static HttpResponse.Analysis analyzeMessage(IHttpRequestResponse message) {
+        if (message instanceof SimpleHttpRequestResponse) {
+            HttpResponse.Analysis saved = ((SimpleHttpRequestResponse)message).responseAnalysis;
+            if (saved != null) return saved;
         }
-        try {
-            return Utils.helpers.analyzeResponse(responseBytes).getStatedMimeType();
-        } catch (Exception e) {
-            return "";
-        }
+        if (message == null) return HttpResponse.analyze(null, "");
+        byte[] request = message.getRequest();
+        String method = request == null ? "" : new String(request, 0, Math.min(request.length, 32),
+                StandardCharsets.ISO_8859_1).split(" ", 2)[0];
+        return HttpResponse.analyze(message.getResponse(), method);
     }
 
-    private static String extractBodyAsString(byte[] responseBytes) {
-        if (responseBytes == null) {
-            return "";
+    private static final class ResponseComparison {
+        final short oldStatus, newStatus;
+        final String body, baselineBody, issue;
+        final double ratio;
+        final boolean complete;
+        ResponseComparison(IHttpRequestResponse original, HttpResponse.Analysis current) {
+            HttpResponse.Analysis baseline = analyzeMessage(original);
+            oldStatus = (short)baseline.statusCode;
+            newStatus = (short)current.statusCode;
+            complete = current.complete;
+            HttpResponse.Text oldText = original instanceof SimpleHttpRequestResponse
+                    ? ((SimpleHttpRequestResponse)original).responseText : null;
+            if (oldText == null) oldText = baseline.decodeText();
+            HttpResponse.Text newText = current.decodeText();
+            baselineBody = oldText.value;
+            body = newText.value;
+            ratio = oldText.value == null || newText.value == null ? Double.NaN
+                    : DiffPage.getRatio(oldText.value, newText.value, current.header("Content-Type"));
+            issue = !newText.issue.isEmpty() ? newText.issue
+                    : !oldText.issue.isEmpty() ? "baseline: " + oldText.issue : "";
         }
-        try {
-            IResponseInfo info = Utils.helpers.analyzeResponse(responseBytes);
-            int offset = info.getBodyOffset();
-            if (offset < 0 || offset >= responseBytes.length) {
-                return "";
-            }
-            byte[] body = Arrays.copyOfRange(responseBytes, offset, responseBytes.length);
-            return new String(body, "utf-8");
-        } catch (Exception e) {
-            return "";
-        }
+        String reason(String reason) { return issue.isEmpty() ? reason : reason + "; " + issue; }
     }
 
-    private static String findHeaderValue(List<String> headers, String name) {
-        if (headers == null || name == null) {
-            return null;
-        }
-        for (String h : headers) {
-            if (h == null)
-                continue;
-            if (h.regionMatches(true, 0, name, 0, name.length()) && h.length() > name.length()
-                    && h.charAt(name.length()) == ':') {
-                return h.substring(name.length() + 1).trim();
-            }
+    static String baselineSummary(IHttpRequestResponse reference, HttpResponse.Analysis replay) {
+        if (reference == null || reference.getResponse() == null || reference.getResponse().length == 0)
+            return I18n.t("baseline.no_reference") + " | " + replay.statusCode + " / " + replay.rawBytes.length + "B";
+        HttpResponse.Analysis previous = analyzeMessage(reference);
+        ResponseComparison comparison = new ResponseComparison(reference, replay);
+        boolean locationChanged = !previous.header("Location").equals(replay.header("Location"));
+        boolean typeChanged = !previous.header("Content-Type").equalsIgnoreCase(replay.header("Content-Type"));
+        boolean changed = previous.statusCode != replay.statusCode || locationChanged || typeChanged
+                || (comparison.baselineBody != null && comparison.body != null && !comparison.baselineBody.equals(comparison.body));
+        String label = changed ? "baseline.changed"
+                : !previous.complete || !replay.complete || comparison.baselineBody == null || comparison.body == null
+                ? "baseline.unknown" : "baseline.same";
+        return I18n.t(label) + " | " + responseMetrics(reference, replay, comparison.ratio)
+                + (locationChanged ? " | " + I18n.t("baseline.location_changed") : "")
+                + (typeChanged ? " | " + I18n.t("baseline.type_changed") : "")
+                + (comparison.issue.isEmpty() ? "" : " | " + comparison.issue);
+    }
+
+    static String responseMetrics(IHttpRequestResponse reference, HttpResponse.Analysis current) {
+        return responseMetrics(reference, current, new ResponseComparison(reference, current).ratio);
+    }
+
+    private static String responseMetrics(IHttpRequestResponse reference, HttpResponse.Analysis current, double ratio) {
+        return I18n.t("baseline.metrics", formatStatus((short)analyzeMessage(reference).statusCode),
+                formatStatus((short)current.statusCode), reference.getResponse().length, current.rawBytes.length,
+                Double.isFinite(ratio) ? String.format(Locale.ROOT, "%.2f", ratio) : "N/A");
+    }
+
+    private static String candidateReason(IHttpRequestResponse original, byte[] variant,
+                                          HttpResponse.Analysis response, double ratio, String reason, boolean raw) {
+        if (!(original instanceof SimpleHttpRequestResponse)) return reason;
+        String baseline = ((SimpleHttpRequestResponse)original).baselineReason;
+        if (baseline.isEmpty()) return reason;
+        return baseline + "; " + I18n.t("auto.changes", ManualWafPanel.requestDiffSummary(original.getRequest(), variant))
+                + "; " + I18n.t("baseline.compare", responseMetrics(original, response, ratio))
+                + (raw ? "; " + I18n.t("baseline.raw_comparison") : "") + "; " + reason;
+    }
+
+    private SimpleHttpRequestResponse replayBaseline(SimpleHttpRequestResponse captured, boolean followRedirect,
+                                                    int maxRedirects, ScanSession session, ExecutorService executor) throws Exception {
+        Utils.panel.addAllRequestNum(session, 1);
+        Utils.panel.checkingBaseline(session, RedirectPolicy.requestUrl(captured.getHttpService(), captured.getRequest()).toString());
+        FutureTask<SimpleHttpRequestResponse> replay = new FutureTask<>(() -> {
+            SendResult sent = sendWithRedirectPolicy(captured.getHttpService(), captured.getRequest(),
+                    followRedirect, maxRedirects, session);
+            if (session.cancelled) return null;
+            HttpResponse.Analysis analysis = sent.analysis();
+            if (!analysis.complete) throw new IllegalStateException("Baseline: " + analysis.issue);
+            SimpleHttpRequestResponse snapshot = new SimpleHttpRequestResponse(captured.getHttpService(),
+                    captured.getRequest(), sent.getJudgedResponseBytes().clone());
+            snapshot.responseAnalysis = analysis;
+            snapshot.responseText = analysis.decodeText();
+            snapshot.baselineReason = baselineSummary(captured, analyzeMessage(sent.testedMessage));
+            if (sent.redirectCount > 0) snapshot.baselineReason += " | " + I18n.t("baseline.final", analysis.statusCode, analysis.rawBytes.length);
+            addLog(session, sent, Utils.getBodyTitle(snapshot.responseText.value == null ? "" : snapshot.responseText.value),
+                    "baseline", snapshot.baselineReason, Bypass.Outcome.BASELINE);
+            Utils.panel.addFinishRequestNum(session, 1);
+            Utils.panel.baselineChecked(session, snapshot.baselineReason);
+            return snapshot;
+        });
+        Utils.submitScan(executor, session, replay);
+        while (!session.cancelled && !executor.isShutdown()) {
+            try { return replay.get(250, TimeUnit.MILLISECONDS); }
+            catch (TimeoutException waiting) { /* Keep cancellation responsive while the transport finishes. */ }
         }
         return null;
     }
 
     private SendResult sendWithRedirectPolicy(IHttpService service, byte[] requestBytes,
-                                              boolean followRedirect, int maxRedirects) {
+                                              boolean followRedirect, int maxRedirects, ScanSession session) {
         int maxHops = normalizeMaxRedirects(maxRedirects);
+        if (session.cancelled) return new SendResult(service, requestBytes, null, followRedirect, maxHops);
         IHttpRequestResponse firstResponse = Utils.callbacks.makeHttpRequest(service, requestBytes);
         SendResult result = new SendResult(service, requestBytes, firstResponse, followRedirect, maxHops);
         if (!followRedirect || firstResponse == null || firstResponse.getResponse() == null || service == null) {
@@ -448,53 +505,47 @@ public class BypassMain implements IContextMenuFactory, IProxyListener {
         IHttpRequestResponse current = firstResponse;
         byte[] currentRequestBytes = requestBytes;
         java.util.HashSet<String> visited = new java.util.HashSet<>();
+        try { visited.add(RedirectPolicy.requestUrl(service, requestBytes).toString()); }
+        catch (Exception ignored) { }
 
-        for (int i = 0; i < maxHops; i++) {
+        for (int i = 0; i < maxHops && !session.cancelled; i++) {
             byte[] resp = current.getResponse();
             if (resp == null) {
                 return result;
             }
-            short code = getStatusSafe(resp);
+            HttpResponse.Analysis analysis = result.analysis();
+            short code = (short)analysis.statusCode;
             if (!isRedirectStatus(code)) {
                 return result;
             }
 
-            List<String> headers = Utils.helpers.analyzeResponse(resp).getHeaders();
-            String location = findHeaderValue(headers, "Location");
+            String location = analysis.header("Location");
             if (location == null || location.isEmpty()) {
                 return result;
             }
 
             try {
-                URL base = Utils.helpers.analyzeRequest(service, currentRequestBytes).getUrl();
-                URL next = new URL(base, location);
-                if (!service.getHost().equalsIgnoreCase(next.getHost())) {
+                URL next = RedirectPolicy.resolve(service, currentRequestBytes, location);
+                if (!visited.add(next.toString())) {
+                    result.stopReason = I18n.t("redirect.loop");
                     return result;
                 }
-                String protocol = next.getProtocol();
-                if (protocol != null && !protocol.equalsIgnoreCase(service.getProtocol())) {
-                    return result;
-                }
-                String key = next.toString();
-                if (!visited.add(key)) {
-                    return result;
-                }
-
-                String method = (code == 307 || code == 308)
-                        ? Utils.helpers.analyzeRequest(service, currentRequestBytes).getMethod()
-                        : "GET";
-                byte[] nextReq = buildFollowRequest(currentRequestBytes, service, next, method);
+                byte[] nextReq = RedirectPolicy.followRequest(currentRequestBytes, next, code);
+                if (session.cancelled) return result;
                 current = Utils.callbacks.makeHttpRequest(service, nextReq);
-                if (current == null) {
-                    return result;
+                if (current == null || current.getResponse() == null || current.getResponse().length == 0) {
+                    throw new IllegalStateException(I18n.t("manual.no_response"));
                 }
                 currentRequestBytes = nextReq;
                 result.recordRedirect(next, current);
             } catch (Exception e) {
+                result.stopReason = I18n.t("redirect.stopped", e.getMessage());
                 return result;
             }
         }
 
+        if (!session.cancelled && isRedirectStatus(getStatusSafe(result.getJudgedResponseBytes())))
+            result.stopReason = I18n.t("redirect.limit");
         return result;
     }
 
@@ -505,39 +556,6 @@ public class BypassMain implements IContextMenuFactory, IProxyListener {
         return Math.min(maxRedirects, 10);
     }
 
-    private byte[] buildFollowRequest(byte[] originalRequestBytes, IHttpService service, URL nextUrl, String method) {
-        IRequestInfo requestInfo = Utils.helpers.analyzeRequest(service, originalRequestBytes);
-        List<String> headers = new ArrayList<>(requestInfo.getHeaders());
-        if (headers.isEmpty()) {
-            return originalRequestBytes;
-        }
-
-        String requestLine = headers.get(0);
-        String[] parts = requestLine.split(" ", 3);
-        String httpVersion = parts.length >= 3 ? parts[2] : "HTTP/1.1";
-        String path = nextUrl.getFile();
-        headers.set(0, method + " " + path + " " + httpVersion);
-
-        // 307/308 保留原 body，其它情况默认不带 body
-        byte[] body = null;
-        if ("POST".equalsIgnoreCase(method) || "PUT".equalsIgnoreCase(method) || "PATCH".equalsIgnoreCase(method)) {
-            int bodyOffset = requestInfo.getBodyOffset();
-            if (bodyOffset >= 0 && bodyOffset < originalRequestBytes.length) {
-                body = Arrays.copyOfRange(originalRequestBytes, bodyOffset, originalRequestBytes.length);
-            }
-        }
-
-        // method 变更/重定向跟随时，清理与 body 强相关的头，避免 GET 还带旧 Content-Length 导致异常
-        if (body == null) {
-            removeHeadersIgnoreCase(headers, "Content-Length", "Transfer-Encoding", "Content-Type", "Content-Encoding",
-                    "Expect");
-        } else {
-            removeHeadersIgnoreCase(headers, "Transfer-Encoding", "Expect");
-            updateOrAddHeader(headers, "Content-Length", String.valueOf(body.length));
-        }
-        return Utils.helpers.buildHttpMessage(headers, body);
-    }
-
     private static class SendResult {
         final IHttpRequestResponse testedMessage;
         IHttpRequestResponse judgedMessage;
@@ -546,7 +564,9 @@ public class BypassMain implements IContextMenuFactory, IProxyListener {
         final boolean followRedirect;
         final int maxRedirects;
         int redirectCount;
+        String stopReason = "";
         final List<String> redirectChain = new ArrayList<>();
+        HttpResponse.Analysis judgedAnalysis;
 
         SendResult(IHttpService service, byte[] testedRequestBytes, IHttpRequestResponse testedMessage,
                    boolean followRedirect, int maxRedirects) {
@@ -565,7 +585,13 @@ public class BypassMain implements IContextMenuFactory, IProxyListener {
             redirectCount++;
             finalUrl = nextUrl;
             judgedMessage = nextMessage;
+            judgedAnalysis = null;
             redirectChain.add(displayUrl(nextUrl));
+        }
+
+        HttpResponse.Analysis analysis() {
+            if (judgedAnalysis == null) judgedAnalysis = analyzeMessage(judgedMessage);
+            return judgedAnalysis;
         }
 
         byte[] getJudgedResponseBytes() {
@@ -574,16 +600,13 @@ public class BypassMain implements IContextMenuFactory, IProxyListener {
 
         String redirectDisplay() {
             if (!followRedirect) {
-                return "false";
+                return stopReason.isEmpty() ? "false" : "false (Raw)";
             }
-            return "true " + redirectCount + "/" + maxRedirects;
+            return "true " + redirectCount + "/" + maxRedirects + (stopReason.isEmpty() ? "" : " (stopped)");
         }
 
         String redirectTooltip() {
-            if (redirectChain.size() <= 1) {
-                return "";
-            }
-            return StringUtils.join(redirectChain, " -> ");
+            return StringUtils.join(redirectChain, " -> ") + (stopReason.isEmpty() ? "" : " | " + stopReason);
         }
 
         private static URL analyzeUrl(IHttpService service, byte[] requestBytes) {
@@ -635,6 +658,7 @@ public class BypassMain implements IContextMenuFactory, IProxyListener {
         list = new ArrayList<JMenuItem>();
 
         if (invocation != null && invocation.getSelectedMessages() != null
+                && invocation.getSelectedMessages().length > 0
                 && invocation.getSelectedMessages()[0] != null
                 && invocation.getSelectedMessages()[0].getHttpService() != null) {
             JMenuItem acMenuItem = new JMenuItem("Send to BypassPro (Access Control)");
@@ -644,21 +668,16 @@ public class BypassMain implements IContextMenuFactory, IProxyListener {
             acMenuItem.addActionListener(new ActionListener() {
                 public void actionPerformed(ActionEvent e) {
 
-                    new Thread(() -> {
-                        IHttpRequestResponse[] iHttpRequestResponses = invocation.getSelectedMessages();
-                        processHttp(iHttpRequestResponses, "send access", Utils.PROFILE_AUTO_ACCESS_BYPASS);
-                    }).start();
+                    Utils.panel.showDashboard();
+                    enqueueHttp(invocation.getSelectedMessages(), "send access", Utils.PROFILE_AUTO_ACCESS_BYPASS);
 
                 }
             });
 
             wafMenuItem.addActionListener(new ActionListener() {
                 public void actionPerformed(ActionEvent e) {
-                    new Thread(() -> {
-                        IHttpRequestResponse[] iHttpRequestResponses = invocation.getSelectedMessages();
-                        // WAF 模式：使用 profiles.auto_waf_bypass
-                        processHttp(iHttpRequestResponses, "send waf", Utils.PROFILE_AUTO_WAF_BYPASS);
-                    }).start();
+                    Utils.panel.showDashboard();
+                    enqueueHttp(invocation.getSelectedMessages(), "send waf", Utils.PROFILE_AUTO_WAF_BYPASS);
                 }
             });
 
@@ -668,7 +687,7 @@ public class BypassMain implements IContextMenuFactory, IProxyListener {
                         IHttpRequestResponse[] messages = invocation.getSelectedMessages();
                         if (messages != null && messages.length > 0) {
                             // 加载到 Manual WAF 面板
-                            Utils.panel.getManualWafPanel().loadRequest(messages[0]);
+                            if (Utils.panel.getManualWafPanel().acceptRequest(messages[0])) Utils.panel.showManualWaf();
                         }
                     });
                 }
@@ -681,18 +700,26 @@ public class BypassMain implements IContextMenuFactory, IProxyListener {
         return list;
     }
 
-    private void addLog(SendResult sendResult, String title, String tool, String reason) {
+    private void addLog(ScanSession session, SendResult sendResult, String title, String tool, String reason, boolean signal) {
+        addLog(session, sendResult, title, tool, reason, signal ? Bypass.Outcome.SIGNAL : Bypass.Outcome.FILTERED);
+    }
+
+    private void addLog(ScanSession session, SendResult sendResult, String title, String tool, String reason, Bypass.Outcome outcome) {
         // 入表写 UI：放到 EDT 串行执行，避免并发写 ArrayList 造成数据竞争
-        try {
+        {
             IHttpRequestResponse messageInfo = sendResult.judgedMessage;
             if (messageInfo == null || messageInfo.getResponse() == null) {
                 return;
             }
-            short statusCode = Utils.helpers.analyzeResponse(messageInfo.getResponse()).getStatusCode();
-            if (statusCode == 200 || statusCode == 405 || statusCode == 415) {
+            short statusCode = (short)sendResult.analysis().statusCode;
+            if (!session.cancelled) {
+                if (outcome != Bypass.Outcome.BASELINE) {
+                    reason = (outcome == Bypass.Outcome.SIGNAL ? "Signal; " : "Filtered: no candidate signal; ") + reason;
+                    if (statusCode == 405 || statusCode == 415) reason += "; parser/method clue, not confirmed bypass";
+                }
                 String displayMethod = Utils.helpers.analyzeRequest(
                         sendResult.testedMessage == null ? messageInfo : sendResult.testedMessage).getMethod();
-                Utils.panel.getBypassTableModel().addBypass(new Bypass(
+                Utils.panel.addResult(session, new Bypass(
                         DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss").format(LocalDateTime.now()),
                         displayMethod,
                         String.valueOf(messageInfo.getResponse().length),
@@ -700,12 +727,11 @@ public class BypassMain implements IContextMenuFactory, IProxyListener {
                         sendResult.testedUrl == null ? Utils.helpers.analyzeRequest(messageInfo).getUrl() : sendResult.testedUrl,
                         sendResult.redirectDisplay(),
                         sendResult.redirectTooltip(),
-                        Utils.helpers.analyzeResponse(messageInfo.getResponse()).getStatusCode(),
-                        Utils.helpers.analyzeResponse(messageInfo.getResponse()).getStatedMimeType(),
+                        statusCode,
+                        sendResult.analysis().header("Content-Type"),
                         title,
-                        nextId(), tool, reason));
+                        nextId(), tool, reason, outcome));
             }
-        } catch (Exception ignored) {
         }
     }
 
@@ -727,20 +753,62 @@ public class BypassMain implements IContextMenuFactory, IProxyListener {
         return -1;
     }
 
-    private static synchronized void addAllRequestNum(int num) {
-        Utils.panel.addAllRequestNum(num);
+    private void recordFailure(ScanSession session, IHttpService service, byte[] request, String tool, Exception failure) {
+        if (session.cancelled) return;
+        Utils.panel.addErrorRequestNum(session, 1);
+        try {
+            IHttpRequestResponse message = new SimpleHttpRequestResponse(service, request, new byte[0]);
+            URL url = RedirectPolicy.requestUrl(service, request);
+            Utils.panel.addResult(session, new Bypass(
+                    DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss").format(LocalDateTime.now()),
+                    Utils.helpers.analyzeRequest(service, request).getMethod(), "0",
+                    Utils.callbacks.saveBuffersToTempFiles(message), url, "", "", (short) 0, "", "",
+                    nextId(), tool, "Error: " + failure.getMessage(), Bypass.Outcome.ERROR));
+        } catch (Exception persistence) {
+            Utils.panel.preparationFailed(session, "Could not record failed request: " + persistence.getMessage());
+            Utils.out("Request failed: " + failure.getMessage());
+        }
     }
 
-    private static synchronized void addFinishRequestNum(int num) {
-        Utils.panel.addFinishRequestNum(num);
+    private void enqueueHttp(IHttpRequestResponse[] messages, String tool, String profile) {
+        ScanSession session = Utils.panel == null ? new ScanSession() : Utils.panel.sessionForInput("auto".equals(tool));
+        if (session == null) return;
+        if (!Utils.dispatchScan(() -> {
+            if (session.cancelled) return;
+            try { processHttp(messages, tool, profile, session); }
+            catch (Exception e) { if (Utils.panel != null) Utils.panel.preparationFailed(session, e.getMessage()); }
+        })
+                && Utils.panel != null) Utils.panel.queueFull();
     }
-    // public void setThread_num(int number) {
-    // thread_num = number;
-    // }
 
-    public void processHttp(IHttpRequestResponse[] iHttpRequestResponses, String tool, String profile) {
+    public void processHttp(IHttpRequestResponse[] messages, String tool, String profile) {
+        enqueueHttp(messages, tool, profile);
+    }
 
+    protected void processHttp(IHttpRequestResponse[] iHttpRequestResponses, String tool, String profile, ScanSession session) {
+        if (iHttpRequestResponses == null) return;
         for (IHttpRequestResponse iHttpRequestResponse : iHttpRequestResponses) {
+            if (session.cancelled) return;
+            if (iHttpRequestResponse == null || iHttpRequestResponse.getHttpService() == null || iHttpRequestResponse.getRequest() == null) continue;
+            byte[] sourceResponse = iHttpRequestResponse.getResponse();
+            SimpleHttpRequestResponse snapshot = new SimpleHttpRequestResponse(iHttpRequestResponse.getHttpService(),
+                    iHttpRequestResponse.getRequest().clone(), sourceResponse == null ? null : sourceResponse.clone());
+            snapshot.responseAnalysis = analyzeMessage(snapshot);
+            snapshot.responseText = snapshot.responseAnalysis.decodeText();
+            int thread_num = Utils.panel.getThreadNum();
+            boolean followRedirect = Utils.panel.isFollowRedirectEnabled();
+            int maxRedirects = Utils.getConfigMaxRedirects(DEFAULT_MAX_REDIRECT_HOPS);
+            ExecutorService es = Utils.getSharedExecutor(thread_num);
+            try {
+                snapshot = replayBaseline(snapshot, followRedirect, maxRedirects, session, es);
+            } catch (Exception e) {
+                recordFailure(session, iHttpRequestResponse.getHttpService(), iHttpRequestResponse.getRequest(), "baseline",
+                        e.getCause() instanceof Exception ? (Exception)e.getCause() : e);
+                Utils.panel.baselineChecked(session, I18n.t("baseline.failed"));
+                continue;
+            }
+            if (snapshot == null || session.cancelled) return;
+            iHttpRequestResponse = snapshot;
             IRequestInfo reqInfo = Utils.helpers.analyzeRequest(iHttpRequestResponse);
             String old_path = reqInfo.getUrl().getPath();
             String query = reqInfo.getUrl().getQuery();
@@ -760,47 +828,24 @@ public class BypassMain implements IContextMenuFactory, IProxyListener {
                 }
             }
 
-            int thread_num = Utils.panel.getThreadNum();
-            boolean followRedirect = Utils.panel != null && Utils.panel.isFollowRedirectEnabled();
-            int maxRedirects = Utils.getConfigMaxRedirects(DEFAULT_MAX_REDIRECT_HOPS);
-
             Utils.out("start thread, number: " + String.valueOf(thread_num) + " path: " + old_path);
-            ExecutorService es = Utils.getSharedExecutor(thread_num);
 
-            // 更新请求计数
-            addAllRequestNum(allRequests.size());
+            List<Runnable> jobs = new ArrayList<>();
             for (BaseRequest baseRequest : allRequests) {
-                es.submit(new BypassMain.Run_request(baseRequest, iHttpRequestResponse, tool,
-                        followRedirect, maxRedirects));
+                jobs.add(new Run_request(baseRequest, iHttpRequestResponse, tool, followRedirect, maxRedirects, session));
             }
-
-            // WAF 模式：额外生成 Body 编码变体（仅 POST/PUT/PATCH）
             if (Utils.PROFILE_AUTO_WAF_BYPASS.equals(profile)) {
                 byte[] requestBytes = iHttpRequestResponse.getRequest();
-                if (requestBytes != null) {
-                    IRequestInfo wafReqInfo = Utils.helpers.analyzeRequest(iHttpRequestResponse.getHttpService(),
-                            requestBytes);
-                    String wafMethod = wafReqInfo.getMethod();
-
-                    if (hasBody(wafMethod, requestBytes, wafReqInfo)) {
-                        List<byte[]> bodyEncodedRequests = generateBodyEncodedRequests(requestBytes, wafReqInfo,
-                                iHttpRequestResponse.getHttpService());
-                        addAllRequestNum(bodyEncodedRequests.size());
-
-                        for (byte[] encodedRequest : bodyEncodedRequests) {
-                            es.submit(new Run_body_encoded_request(encodedRequest, iHttpRequestResponse, tool,
-                                    followRedirect, maxRedirects));
-                        }
-                    }
-
-                    List<GhostBitsAutoVariant> ghostVariants = generateGhostBitsAutoVariants(requestBytes);
-                    addAllRequestNum(ghostVariants.size());
-                    for (GhostBitsAutoVariant variant : ghostVariants) {
-                        es.submit(new Run_ghost_bits_request(variant, iHttpRequestResponse, tool,
-                                followRedirect, maxRedirects));
-                    }
+                IRequestInfo wafReqInfo = Utils.helpers.analyzeRequest(iHttpRequestResponse.getHttpService(), requestBytes);
+                if (hasBody(originalMethod, requestBytes, wafReqInfo)) {
+                    for (byte[] encoded : generateBodyEncodedRequests(requestBytes, wafReqInfo, iHttpRequestResponse.getHttpService()))
+                        jobs.add(new Run_body_encoded_request(encoded, iHttpRequestResponse, tool, followRedirect, maxRedirects, session));
                 }
+                for (GhostBitsAutoVariant variant : generateGhostBitsAutoVariants(requestBytes))
+                    jobs.add(new Run_ghost_bits_request(variant, iHttpRequestResponse, tool, followRedirect, maxRedirects, session));
             }
+            Utils.panel.addAllRequestNum(session, jobs.size());
+            for (Runnable job : jobs) Utils.submitScan(es, session, job);
 
             // 使用全局共享线程池：不在此处 shutdown
         }
@@ -836,7 +881,7 @@ public class BypassMain implements IContextMenuFactory, IProxyListener {
 
         // 如果原始请求是 chunked 传输，则 body 区域很可能包含 chunk framing，直接做编码/压缩/类型欺骗会破坏语义
         // 这里保守处理：跳过所有 body 变体（避免发送格式错误的请求）
-        if (hasHeaderToken(originalHeaders, "Transfer-Encoding", "chunked")) {
+        if (RequestBodyPolicy.hasTransferEncoding(RequestBodyPolicy.headers(originalRequest))) {
             return result;
         }
 
@@ -895,7 +940,7 @@ public class BypassMain implements IContextMenuFactory, IProxyListener {
 
         // Gzip 变体（避免重复 gzip：原始已 gzip 则跳过）
         if (Boolean.TRUE.equals(transformOptions.get("gzip"))
-                && !hasHeaderToken(originalHeaders, "Content-Encoding", "gzip")) {
+                && RequestBodyPolicy.isEditable(originalRequest)) {
             byte[] gzipped = gzipBody(originalBody);
             if (gzipped != null) {
                 result.add(buildRequestWithGzipBody(originalHeaders, gzipped));
@@ -978,17 +1023,14 @@ public class BypassMain implements IContextMenuFactory, IProxyListener {
             if (!isTextualContentType(contentType)) {
                 return null;
             }
-            if (hasHeaderToken(originalHeaders, "Content-Encoding", "gzip")) {
+            if (!RequestBodyPolicy.isEditable(StringUtils.join(originalHeaders, "\r\n"))) {
                 return null;
             }
 
-            // 严格 UTF-8 解码：遇到非法字节直接放弃，避免 U+FFFD 替换导致 payload 损坏
-            CharsetDecoder dec = StandardCharsets.UTF_8.newDecoder()
-                    .onMalformedInput(CodingErrorAction.REPORT)
-                    .onUnmappableCharacter(CodingErrorAction.REPORT);
-            String bodyStr = dec.decode(ByteBuffer.wrap(body)).toString();
+            // 按声明字符集严格解码和编码，避免替换字符损坏 payload
+            String bodyStr = TextCodec.decode(body, RequestBodyPolicy.charset(StringUtils.join(originalHeaders, "\r\n")));
             Charset charset = Charset.forName(charsetName);
-            return bodyStr.getBytes(charset);
+            return TextCodec.encode(bodyStr, charset);
         } catch (Exception e) {
             return null;
         }
@@ -1004,25 +1046,6 @@ public class BypassMain implements IContextMenuFactory, IProxyListener {
                 || ct.contains("x-www-form-urlencoded")
                 || ct.contains("javascript")
                 || ct.contains("html");
-    }
-
-    private boolean hasHeaderToken(List<String> headers, String name, String token) {
-        if (headers == null || name == null || token == null)
-            return false;
-        for (int i = 1; i < headers.size(); i++) {
-            String h = headers.get(i);
-            if (h == null)
-                continue;
-            int colon = h.indexOf(':');
-            if (colon <= 0)
-                continue;
-            String n = h.substring(0, colon).trim();
-            if (!n.equalsIgnoreCase(name))
-                continue;
-            String v = h.substring(colon + 1).trim().toLowerCase();
-            return v.contains(token.toLowerCase());
-        }
-        return false;
     }
 
     /**
@@ -1103,6 +1126,7 @@ public class BypassMain implements IContextMenuFactory, IProxyListener {
      */
     private byte[] smartWrapBodyAsMultipart(byte[] originalBody, String boundary, List<String> headers) {
         try {
+            if (!RequestBodyPolicy.isEditable(StringUtils.join(headers, "\r\n"))) return null;
             String originalContentType = getOriginalContentType(headers).toLowerCase();
             if (!originalContentType.contains("application/x-www-form-urlencoded")) {
                 return null;
@@ -1110,8 +1134,8 @@ public class BypassMain implements IContextMenuFactory, IProxyListener {
             if (originalBody == null || originalBody.length == 0) {
                 return null;
             }
-            Charset cs = extractCharsetFromContentType(headers);
-            String bodyStr = new String(originalBody, cs);
+            Charset cs = RequestBodyPolicy.charset(StringUtils.join(headers, "\r\n"));
+            String bodyStr = TextCodec.decode(originalBody, cs);
             if (bodyStr.trim().isEmpty()) {
                 return null;
             }
@@ -1132,52 +1156,13 @@ public class BypassMain implements IContextMenuFactory, IProxyListener {
                 out.write(("Content-Type: text/plain; charset=" + cs.name() + "\r\n")
                         .getBytes(StandardCharsets.ISO_8859_1));
                 out.write(("\r\n").getBytes(StandardCharsets.ISO_8859_1));
-                out.write(value.getBytes(cs));
+                out.write(TextCodec.encode(value, cs));
                 out.write(("\r\n").getBytes(StandardCharsets.ISO_8859_1));
             }
             out.write(("--" + boundary + "--\r\n").getBytes(StandardCharsets.ISO_8859_1));
             return out.toByteArray();
         } catch (Exception e) {
             return null;
-        }
-    }
-
-    private Charset extractCharsetFromContentType(List<String> headers) {
-        String ct = null;
-        if (headers != null) {
-            for (int i = 1; i < headers.size(); i++) {
-                String h = headers.get(i);
-                if (h == null)
-                    continue;
-                int colon = h.indexOf(':');
-                if (colon <= 0)
-                    continue;
-                String n = h.substring(0, colon).trim();
-                if (!n.equalsIgnoreCase("Content-Type"))
-                    continue;
-                ct = h.substring(colon + 1).trim();
-                break;
-            }
-        }
-        if (ct == null || ct.isEmpty()) {
-            return StandardCharsets.UTF_8;
-        }
-        java.util.regex.Matcher m = java.util.regex.Pattern.compile("(?i)charset\\s*=\\s*([^;\\r\\n]+)").matcher(ct);
-        if (!m.find()) {
-            return StandardCharsets.UTF_8;
-        }
-        String name = m.group(1);
-        if (name == null) {
-            return StandardCharsets.UTF_8;
-        }
-        name = name.trim();
-        if (name.startsWith("\"") && name.endsWith("\"") && name.length() >= 2) {
-            name = name.substring(1, name.length() - 1).trim();
-        }
-        try {
-            return Charset.forName(name);
-        } catch (Exception ignored) {
-            return StandardCharsets.UTF_8;
         }
     }
 
@@ -1256,9 +1241,11 @@ public class BypassMain implements IContextMenuFactory, IProxyListener {
         private final String tool;
         private final boolean followRedirect;
         private final int maxRedirects;
+        private final ScanSession session;
 
         public Run_body_encoded_request(byte[] requestBytes, IHttpRequestResponse originalReqResp, String tool,
-                                        boolean followRedirect, int maxRedirects) {
+                                        boolean followRedirect, int maxRedirects, ScanSession session) {
+            this.session = session;
             this.requestBytes = requestBytes;
             this.originalReqResp = originalReqResp;
             this.tool = tool;
@@ -1268,34 +1255,35 @@ public class BypassMain implements IContextMenuFactory, IProxyListener {
 
         @Override
         public void run() {
+            if (session.cancelled) return;
             try {
                 SendResult sendResult = sendWithRedirectPolicy(originalReqResp.getHttpService(), requestBytes,
-                        followRedirect, maxRedirects);
+                        followRedirect, maxRedirects, session);
 
-                byte[] oldResponseBytes = originalReqResp.getResponse();
                 byte[] finalResponseBytes = sendResult.getJudgedResponseBytes();
+                if (session.cancelled) return;
+                if (finalResponseBytes == null || finalResponseBytes.length == 0)
+                    throw new IllegalStateException(I18n.t("manual.no_response"));
 
-                short oldStatus = getStatusSafe(oldResponseBytes);
-                short newStatus = getStatusSafe(finalResponseBytes);
-                String newMime = getMimeSafe(finalResponseBytes);
-
-                String oldBody = extractBodyAsString(oldResponseBytes);
-                String newBody = extractBodyAsString(finalResponseBytes);
                 double threshold = Utils.panel.getSimilarityThreshold();
-                double ratio = DiffPage.getRatio(oldBody, newBody, newMime);
+                ResponseComparison comparison = new ResponseComparison(originalReqResp, sendResult.analysis());
+                short oldStatus = comparison.oldStatus;
+                short newStatus = comparison.newStatus;
+                String newBody = comparison.body;
+                double ratio = comparison.ratio;
                 boolean statusClassChanged = (oldStatus > 0 && newStatus > 0) && (oldStatus / 100 != newStatus / 100);
 
-                boolean shouldLog = isCandidateStatus(newStatus) && (ratio < threshold || statusClassChanged);
+                boolean shouldLog = comparison.complete && isCandidateStatus(newStatus) && (ratio < threshold || statusClassChanged);
 
-                addFinishRequestNum(1);
-
-                if (sendResult.judgedMessage != null && finalResponseBytes != null && shouldLog) {
-                    String title = Utils.getBodyTitle(new String(finalResponseBytes, "utf-8"));
-                    String reason = buildAutoReason(oldStatus, newStatus, ratio, threshold, statusClassChanged);
-                    addLog(sendResult, title, tool, reason);
+                if (sendResult.judgedMessage != null && finalResponseBytes != null) {
+                    String title = Utils.getBodyTitle(newBody == null ? "" : newBody);
+                    String reason = comparison.reason(buildAutoReason(oldStatus, newStatus, ratio, threshold, statusClassChanged));
+                    reason = candidateReason(originalReqResp, requestBytes, sendResult.analysis(), ratio, reason, false);
+                    addLog(session, sendResult, title, tool, reason, shouldLog);
                 }
-            } catch (Throwable e) {
-                Utils.panel.addErrorRequestNum(1);
+                Utils.panel.addFinishRequestNum(session, 1);
+            } catch (Exception e) {
+                recordFailure(session, originalReqResp.getHttpService(), requestBytes, tool, e);
             }
         }
     }
@@ -1324,9 +1312,11 @@ public class BypassMain implements IContextMenuFactory, IProxyListener {
         private final String tool;
         private final boolean followRedirect;
         private final int maxRedirects;
+        private final ScanSession session;
 
         public Run_ghost_bits_request(GhostBitsAutoVariant variant, IHttpRequestResponse originalReqResp, String tool,
-                                      boolean followRedirect, int maxRedirects) {
+                                      boolean followRedirect, int maxRedirects, ScanSession session) {
+            this.session = session;
             this.variant = variant;
             this.originalReqResp = originalReqResp;
             this.tool = tool;
@@ -1336,34 +1326,36 @@ public class BypassMain implements IContextMenuFactory, IProxyListener {
 
         @Override
         public void run() {
+            if (session.cancelled) return;
             try {
                 IHttpService service = originalReqResp.getHttpService();
                 SendResult sendResult;
                 if (variant.isRawRequired()) {
                     IHttpRequestResponse rawResponse = sendGhostVariantRaw(variant, service);
                     sendResult = new SendResult(service, variant.getRequestBytes(),
-                            rawResponse, followRedirect, normalizeMaxRedirects(maxRedirects));
+                            rawResponse, false, normalizeMaxRedirects(maxRedirects));
+                    if (followRedirect) sendResult.stopReason = I18n.t("manual.redirect.raw");
                 } else {
                     sendResult = sendWithRedirectPolicy(service, variant.getRequestBytes(),
-                            followRedirect, maxRedirects);
+                            followRedirect, maxRedirects, session);
                 }
 
                 byte[] finalResponseBytes = sendResult.getJudgedResponseBytes();
-                byte[] oldResponseBytes = originalReqResp.getResponse();
-                short oldStatus = getStatusSafe(oldResponseBytes);
-                short newStatus = getStatusSafe(finalResponseBytes);
-                String newMime = getMimeSafe(finalResponseBytes);
-
-                String oldBody = extractBodyAsString(oldResponseBytes);
-                String newBody = extractBodyAsString(finalResponseBytes);
+                if (session.cancelled) return;
+                if (finalResponseBytes == null || finalResponseBytes.length == 0)
+                    throw new IllegalStateException(I18n.t("manual.no_response"));
                 double threshold = Utils.panel.getSimilarityThreshold();
-                double ratio = DiffPage.getRatio(oldBody, newBody, newMime);
+                ResponseComparison comparison = new ResponseComparison(originalReqResp, sendResult.analysis());
+                short oldStatus = comparison.oldStatus;
+                short newStatus = comparison.newStatus;
+                String newBody = comparison.body;
+                double ratio = comparison.ratio;
                 boolean statusClassChanged = (oldStatus > 0 && newStatus > 0) && (oldStatus / 100 != newStatus / 100);
 
-                String baseReason = buildAutoReason(oldStatus, newStatus, ratio, threshold, statusClassChanged);
+                String baseReason = comparison.reason(buildAutoReason(oldStatus, newStatus, ratio, threshold, statusClassChanged));
                 String signatureReason = buildGhostSignatureReason(newBody);
                 boolean signatureMatched = !signatureReason.isEmpty();
-                boolean shouldLog = isCandidateStatus(newStatus)
+                boolean shouldLog = comparison.complete && isCandidateStatus(newStatus)
                         && (signatureMatched || ratio < threshold || statusClassChanged);
                 String reason = variant.getReason();
                 if (!baseReason.isEmpty()) {
@@ -1373,14 +1365,14 @@ public class BypassMain implements IContextMenuFactory, IProxyListener {
                     reason += "; " + signatureReason;
                 }
 
-                addFinishRequestNum(1);
-
-                if (sendResult.judgedMessage != null && finalResponseBytes != null && shouldLog) {
-                    String title = Utils.getBodyTitle(new String(finalResponseBytes, "utf-8"));
-                    addLog(sendResult, title, ghostToolLabel(tool), reason);
+                reason = candidateReason(originalReqResp, variant.getRequestBytes(), sendResult.analysis(), ratio, reason, variant.isRawRequired());
+                if (sendResult.judgedMessage != null && finalResponseBytes != null) {
+                    String title = Utils.getBodyTitle(newBody == null ? "" : newBody);
+                    addLog(session, sendResult, title, ghostToolLabel(tool), reason, shouldLog);
                 }
-            } catch (Throwable e) {
-                Utils.panel.addErrorRequestNum(1);
+                Utils.panel.addFinishRequestNum(session, 1);
+            } catch (Exception e) {
+                recordFailure(session, originalReqResp.getHttpService(), variant.getRequestBytes(), tool, e);
             }
         }
     }
@@ -1394,9 +1386,10 @@ public class BypassMain implements IContextMenuFactory, IProxyListener {
         }
         RawSocketSender.RawResponse raw = new RawSocketSender().send(host, port, https,
                 variant.getRequestBytes(), 5000, 5000);
-        return new SimpleHttpRequestResponse(service,
-                raw.getRequestBytesActuallySent(),
-                raw.getResponseBytes());
+        SimpleHttpRequestResponse result = new SimpleHttpRequestResponse(service,
+                raw.getRequestBytesActuallySent(), raw.getResponseBytes());
+        result.responseAnalysis = raw.getAnalysis();
+        return result;
     }
 
     private String buildGhostSignatureReason(String body) {
@@ -1417,6 +1410,9 @@ public class BypassMain implements IContextMenuFactory, IProxyListener {
     static class SimpleHttpRequestResponse implements IHttpRequestResponse {
         private byte[] request;
         private byte[] response;
+        private HttpResponse.Analysis responseAnalysis;
+        private HttpResponse.Text responseText;
+        private String baselineReason = "";
         private String comment;
         private String highlight;
         private IHttpService service;
@@ -1431,13 +1427,21 @@ public class BypassMain implements IContextMenuFactory, IProxyListener {
         public byte[] getRequest() { return request; }
 
         @Override
-        public void setRequest(byte[] message) { request = message == null ? new byte[0] : message; }
+        public void setRequest(byte[] message) {
+            request = message == null ? new byte[0] : message;
+            responseAnalysis = null;
+            responseText = null;
+        }
 
         @Override
         public byte[] getResponse() { return response; }
 
         @Override
-        public void setResponse(byte[] message) { response = message == null ? new byte[0] : message; }
+        public void setResponse(byte[] message) {
+            response = message == null ? new byte[0] : message;
+            responseAnalysis = null;
+            responseText = null;
+        }
 
         @Override
         public String getComment() { return comment; }
@@ -1468,8 +1472,9 @@ public class BypassMain implements IContextMenuFactory, IProxyListener {
     @Override
     public void processProxyMessage(boolean messageIsRequest, IInterceptedProxyMessage message) {
 
-        if (Utils.isProxySelected && !messageIsRequest) {
+        if (Utils.isProxySelected && !messageIsRequest && message != null) {
             IHttpRequestResponse httpRequestResponse = message.getMessageInfo();
+            if (httpRequestResponse == null) return;
             byte[] old_response = httpRequestResponse.getResponse();
             if (old_response != null) {
                 short old_status = Utils.helpers.analyzeResponse(old_response).getStatusCode();
@@ -1486,9 +1491,7 @@ public class BypassMain implements IContextMenuFactory, IProxyListener {
                             return;
                         }
                     }
-                    new Thread(() -> {
-                        processHttp(iHttpRequestResponses, "auto", Utils.PROFILE_AUTO_ACCESS_BYPASS);
-                    }).start();
+                    enqueueHttp(iHttpRequestResponses, "auto", Utils.PROFILE_AUTO_ACCESS_BYPASS);
 
                 }
 

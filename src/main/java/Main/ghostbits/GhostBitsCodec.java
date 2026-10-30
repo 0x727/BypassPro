@@ -1,5 +1,7 @@
 package Main.ghostbits;
 
+import Main.I18n;
+
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.ThreadLocalRandom;
@@ -128,9 +130,9 @@ public final class GhostBitsCodec {
     public static String buildFoldPreviewReport(String text, FoldMode mode) {
         String folded = fold(text, mode);
         StringBuilder sb = new StringBuilder();
-        sb.append("原文: ").append(escape(text)).append('\n');
-        sb.append("模式: ").append(foldModeLabel(mode)).append('\n');
-        sb.append("Ghost 还原: ").append(escape(folded)).append("\n\n");
+        sb.append(I18n.t("ghost.original")).append(escape(text)).append('\n');
+        sb.append(I18n.t("ghost.mode")).append(foldModeLabel(mode)).append('\n');
+        sb.append(I18n.t("ghost.restored")).append(escape(folded)).append("\n\n");
         int max = Math.min(text == null ? 0 : text.length(), 48);
         for (int i = 0; i < max; i++) {
             char c = text.charAt(i);

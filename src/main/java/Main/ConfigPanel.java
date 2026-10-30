@@ -19,6 +19,7 @@ import java.util.Map;
 public class ConfigPanel extends JPanel {
     private final JTextField configPathText;
     private final JLabel formatLabel;
+    private final JLabel saveStatus = new JLabel(" ");
     private final JTextArea accessControlTextArea;
     private final JTextArea wafRulesTextArea;
     private final JTextArea manualWafTextArea;
@@ -67,6 +68,7 @@ public class ConfigPanel extends JPanel {
 
     public ConfigPanel() {
         setLayout(new BorderLayout());
+        add(saveStatus, BorderLayout.SOUTH);
         setBorder(new EmptyBorder(10, 10, 10, 10));
 
         // Top panel: config path + buttons
@@ -144,7 +146,7 @@ public class ConfigPanel extends JPanel {
         JPanel wafPanel = createWafPanel();
         JScrollPane manualWafScrollPane = new JScrollPane(manualWafTextArea);
         manualWafScrollPane.setBorder(BorderFactory.createTitledBorder(
-                I18n.t("config.rules.manual_waf") + "  《只读，在 BypassPro-config.yaml 中修改》"));
+                I18n.t("config.rules.manual_waf") + I18n.t("config.read_only_hint")));
 
         // Raw Tab
         rawTextArea = createReadOnlyTextArea();
@@ -155,7 +157,7 @@ public class ConfigPanel extends JPanel {
         tabs.addTab(I18n.t("config.tab.general"), generalPanel);
         tabs.addTab(I18n.t("config.tab.access_control"), acScrollPane);
         tabs.addTab(I18n.t("config.tab.waf"), wafPanel);
-        tabs.addTab(I18n.t("config.tab.manual_waf") + " (只读)", manualWafScrollPane);
+        tabs.addTab(I18n.t("config.tab.manual_waf") + I18n.t("config.read_only_suffix"), manualWafScrollPane);
         tabs.addTab(I18n.t("config.tab.raw"), rawScrollPane);
 
         add(top, BorderLayout.NORTH);
@@ -243,7 +245,7 @@ public class ConfigPanel extends JPanel {
                         I18n.t("dialog.error.title"), JOptionPane.ERROR_MESSAGE);
                 return;
             }
-            if (threshold < 0 || threshold > 1) {
+            if (!Double.isFinite(threshold) || threshold < 0 || threshold > 1) {
                 JOptionPane.showMessageDialog(this,
                         I18n.t("config.dialog.threshold_range"),
                         I18n.t("dialog.error.title"), JOptionPane.ERROR_MESSAGE);
@@ -266,11 +268,10 @@ public class ConfigPanel extends JPanel {
                 if (lang != null && !lang.equalsIgnoreCase(oldLang)) {
                     msg = msg + "\n\n" + I18n.t("config.lang.restart_hint");
                 }
-                JOptionPane.showMessageDialog(this, msg,
-                        I18n.t("dialog.success.title"), JOptionPane.INFORMATION_MESSAGE);
+                saveStatus.setText(msg.replace("\n", " "));
             } else {
                 JOptionPane.showMessageDialog(this,
-                        I18n.t("config.dialog.general_save_failed"),
+                        I18n.t("config.dialog.general_save_failed") + "\n" + String.valueOf(loader.getLastError()),
                         I18n.t("dialog.error.title"), JOptionPane.ERROR_MESSAGE);
             }
         } catch (NumberFormatException e) {
@@ -664,25 +665,31 @@ public class ConfigPanel extends JPanel {
             Map<String, Object> config = loader.loadConfig();
             Utils.setConfigMap(config);
             refreshView();
-            JOptionPane.showMessageDialog(this,
-                    I18n.t("config.dialog.options_saved"),
-                    I18n.t("dialog.success.title"), JOptionPane.INFORMATION_MESSAGE);
+            saveStatus.setText(I18n.t("config.dialog.options_saved"));
         } else {
             JOptionPane.showMessageDialog(this,
-                    I18n.t("config.dialog.options_save_failed"),
+                    I18n.t("config.dialog.options_save_failed") + "\n" + String.valueOf(loader.getLastError()),
                     I18n.t("dialog.error.title"), JOptionPane.ERROR_MESSAGE);
         }
     }
 
     private void reload() {
         ConfigLoader loader = Utils.getConfigLoader();
-        if (loader != null) {
-            Map<String, Object> config = loader.loadConfig();
-            Utils.setConfigMap(config);
-            refreshView();
-            notifyManualWafConfigChanged();
-            System.out.println("reload success...");
+        if (loader == null) return;
+        Map<String, Object> config = loader.loadConfig();
+        if (loader.getLastError() != null) {
+            saveStatus.setText(I18n.t("config.reload_failed"));
+            saveStatus.setToolTipText(loader.getLastError());
+            JOptionPane.showMessageDialog(this, I18n.t("config.reload_failed") + "\n" + loader.getLastError(),
+                    I18n.t("dialog.error.title"), JOptionPane.ERROR_MESSAGE);
+            return;
         }
+        Utils.setConfigMap(config);
+        refreshView();
+        notifyManualWafConfigChanged();
+        if (Utils.panel != null) Utils.panel.updateFromConfig();
+        saveStatus.setText(I18n.t("config.reloaded"));
+        saveStatus.setToolTipText(null);
     }
 
     private void reinit() {

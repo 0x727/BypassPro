@@ -5,6 +5,8 @@ import burp.IHttpRequestResponsePersisted;
 import java.net.URL;
 
 public class Bypass {
+    enum Outcome { SIGNAL, FILTERED, ERROR, BASELINE }
+    final Outcome outcome;
 
     final String timestamp;
     final String length;
@@ -32,6 +34,14 @@ public class Bypass {
                   URL url, String redirect, String redirectTooltip, short status, String mimeType,
                   String title, long id, String tool, String reason) {
 
+        this(timestamp, method, length, requestResponse, url, redirect, redirectTooltip, status, mimeType,
+                title, id, tool, reason, Outcome.SIGNAL);
+    }
+
+    Bypass(String timestamp, String method, String length, IHttpRequestResponsePersisted requestResponse,
+           URL url, String redirect, String redirectTooltip, short status, String mimeType,
+           String title, long id, String tool, String reason, Outcome outcome) {
+        this.outcome = outcome;
         this.timestamp = timestamp;
         this.method = method;
         this.length = length;

@@ -25,7 +25,7 @@
 - [只看案例](#历史案例)
   - [Gh0st Bits 实操案例](#gh0st-bits-实操案例)
   - [历史案例](#历史案例)
-- [当前版本 BypassPro 5.1 更新](#当前版本-bypasspro-51-更新)
+- [当前版本 BypassPro 5.2 更新](#当前版本-bypasspro-52-更新)
   - [模式重构](#1-模式重构)
   - [Manual WAF 工具区重构](#2-manual-waf-工具区重构)
   - [Gh0st Bits 专区](#3-gh0st-bits-专区)
@@ -37,9 +37,13 @@
 - [Auto-WAF 绕过](#3-auto-waf绕过)
 - [Manual-WAF 工作台](#4-manual-waf-工作台)
 
-### 当前版本 BypassPro 5.1 更新
+### 当前版本 BypassPro 5.2 更新
 
-BypassPro 5.1 是一次大版本重构：从单一的 403 bypass 工具，扩展为“自动权限绕过 + 自动 WAF 绕过 + 手动 WAF 工作台”的组合型 Burp 插件。本版本重点增强了手动构造能力、Ghost Bits 测试能力、Raw Socket 发包能力和配置可维护性。
+BypassPro 5.2 在 5.x 的“自动权限绕过 + 自动 WAF 绕过 + 手动 WAF 工作台”基础上，重点改进请求基线、响应判定、任务控制、配置保存和操作布局。
+
+5.2 增加原请求基线重发、手动基线响应切换和变换顺序展示，并修正响应比较、字符集处理及正文转换。Dashboard 顶部采用左侧操作、右侧统计布局；窄窗口自动分行，状态提示单独右对齐。
+
+Manual WAF 将网络目标与操作按钮分行，请求和响应编辑区对齐，基线详情放在编辑区下方。History 优先显示状态、方法和路径，其余列可横向滚动；折叠后腾出工具区空间。
 
 #### 1. 模式重构
 
@@ -69,9 +73,9 @@ BypassPro 5.1 是一次大版本重构：从单一的 403 bypass 工具，扩展
 - 特点：
   - 使用 Burp 原生 `IMessageEditor`，支持 Pretty / Raw / Hex。
   - 支持 Host / Port / HTTPS 手动修改。
-  - 支持 Send / Cancel / Reset / Undo / Redo。
-  - 支持 Follow Redirect，最大跳转次数读取 `general.max_redirects`，默认 3。
-  - 支持 History，便于回放和对比。
+  - 支持 Send / Cancel / 重发原请求 / 恢复原请求 / Undo / Redo。
+  - Burp 发送支持同源 Follow Redirect（相同主机、端口、协议），最大跳转次数读取 `general.max_redirects`，默认 3；Raw 模式会禁用此选项。
+  - History 保存请求、响应、网络目标和发送模式，双击完整载入；可折叠以腾出工具区空间。
 
 #### 2. Manual WAF 工具区重构
 
@@ -88,13 +92,20 @@ BypassPro 5.1 是一次大版本重构：从单一的 403 bypass 工具，扩展
 
 - 有选区时，优先处理用户选中的内容。
 - 多处匹配时，弹出作用域选择：选区处 / 全部 / 第 N 处。
-- 对 URL 编码这类“安全字符默认无变化”的操作，会先确认作用域，再询问是否强制把每个 UTF-8 字节编码成 `%XX`。
+- URL / Base64 直接处理选区原始字节；全角、同形字等文本操作按正文声明字符集解码和编码，失败时保留请求。
+- 对 URL 编码这类“安全字符默认无变化”的操作，会先确认作用域，再询问是否强制把选区每个原始字节编码成 `%XX`。
 - 没有选区且无法安全推断位置时，会提示用户先选中。
 - 支持保持光标位置，避免点击工具后编辑器跳回开头。
 
+整段正文转换及自动正文变形会跳过带传输编码或压缩编码的请求。响应判定使用最终状态码，并先去除 chunk framing、解压 gzip / deflate，再按声明字符集比较；截断或无法解码的正文保留原始响应并说明原因。
+
+Body 转换保持已有 JSON 原样；转换到表单等文本格式时，嵌套 JSON 或文件字段会提示无法转换并保留请求。Ghost 正文变形使用声明字符集，跳过无法表达的候选。
+
+发送准备保留原有 TE/CL 组合，仅在占位符改变普通正文长度时更新 CL。响应比较保留 JSON 字符串内空白；长正文归一化后从全文分段取样，比较最多 8000 字符。
+
 #### 3. Gh0st Bits 专区
 
-新增专门的 **Gh0st Bits** 工作区，用于测试 Java 生态中 `char` 到 `byte` 截断、宽松 hex 解析、多阶段 decode 等解析差异。
+**Gh0st Bits** 工作区用于测试 Java 生态中 `char` 到 `byte` 截断、宽松 hex 解析、多阶段 decode 等解析差异。
 
 手动区能力：
 
@@ -130,8 +141,8 @@ BypassPro 5.1 是一次大版本重构：从单一的 403 bypass 工具，扩展
 底部紧凑预览会显示：
 
 - 当前选区。
-- Ghost 还原结果。
-- URL decode 后结果。
+- 通用 Ghost 低位还原结果。
+- 专用 parser 按对应机制给出本地解码预览，不代表目标服务一定使用该解析器或受影响版本。
 - 风险提示，如 path、separator、CRLF、percent、quote、angle 等。
 
 ##### Ghost Bits 认知纠偏
@@ -703,7 +714,7 @@ profiles:
 - 外置配置路径：`~/.config/BypassPro/BypassPro-config.yaml`。
 - 首次启动会从 jar 内置模板生成配置。
 - Config 页面支持 Reload / Reinit / 保存通用配置 / 保存 WAF 选项。
-- 支持界面语言切换：`general.lang: zh | en`。
+- 支持界面语言切换：`general.lang: zh | en`。在 Config → 通用选择语言，保存后重新加载插件生效。菜单、工具提示、操作弹窗及内置模板说明随语言切换；请求内容、自定义模板和原始 YAML 按原文显示。
 - 支持配置 Follow Redirect 最大跳转次数：`general.max_redirects`，Dashboard 自动模式和 Manual WAF 共用，默认 3。
 
 #### 7. Dashboard 与结果展示
@@ -713,12 +724,15 @@ Dashboard 也做了重构，不再只是简单堆结果表：
 - 顶部控制条改为紧凑布局：
   - `AutoScan` 开关：控制是否监听 Proxy 中的 401/403 响应并自动扫描。
   - `Follow Redirect` 开关：控制 Dashboard 自动模式是否跟随 `301/302/303/307/308`，默认关闭。
-  - `Threads`：当前扫描线程数，默认读取 `general.threads`。
-  - `Req: 已完成 / 总数`：显示当前任务进度。
-  - 进度条：扫描中为动态进度，完成后显示 100%。
+  - `Threads`：Dashboard 全局并发上限，默认读取 `general.threads`；修改后在队列排空后的新输入生效。Manual WAF 使用独立发送。
+  - `计划` / `完成`：基线重发与已生成变体的总量和完成数量，另显示执行中、错误和取消数量。
+  - 进度条：按完成、失败、取消占计划总数的比例展示实际进度；全部失败也会结束。
   - `Err`：错误请求计数。
-  - `Clear`：清空 Dashboard 结果，并重置计数。
-- `Follow Redirect` 按任务发起时快照生效：同一批 AutoScan / Send 请求使用发起时的开关状态和 `general.max_redirects`，中途切换只影响后续任务。
+  - 取消勾选 `AutoScan`：停止接收新流量，已排队任务继续执行。
+  - `Stop`：关闭监听，取消排队任务并忽略本轮晚到结果；底层请求可能仍在结束。
+  - `Clear`：停止本轮，清空 Dashboard 结果、查看器及计数。
+- `Follow Redirect` 按变体准备时快照生效：同一批请求使用准备时的开关状态和 `general.max_redirects`，中途切换影响后续准备的任务；只跟随同源跳转。Raw Ghost 变体不跟随跳转，`Redirect` 提示会说明原因。
+- 每个原请求先重发一次，再生成独立变体。变体与重发响应比较；Reason 显示基线状态、变更区域、状态码、长度和相似度。基线有变化时提示复核；重发失败时跳过该请求的变体。“基线”筛选可查看原请求重发记录，一次重发不证明始终稳定。Raw 变体与 Burp 基线的发送条件差异会单独提示。
 - 相似度阈值不再放在 Dashboard 顶部，统一从 Config 的 `general.similarity_threshold` 读取。
 - Dashboard 表格列调整为：
   - `id`
@@ -737,7 +751,7 @@ Dashboard 也做了重构，不再只是简单堆结果表：
   - `false`：本批任务未启用 Follow Redirect。
   - `true 0/3`：启用 Follow Redirect，但没有发生跳转。
   - `true 1/3`：启用 Follow Redirect，实际跟随 1 次，最大 3 次。
-  - 有跳转链时，鼠标悬停可查看完整链路，例如 `/download.do;.css -> /nolimit.jsp`。
+  - 有跳转链时，鼠标悬停可查看完整链路，例如 `/download.do;.css -> /nolimit.jsp`；遇到跨源、循环或上限时显示停止原因。
 - `Reason` 列展示入表原因，例如：
   - `status:403 -> 200`
   - `sim:0.42 < 0.85`
@@ -761,7 +775,7 @@ Manual WAF 底部也增加了当前请求摘要、payload hints、diff 状态和
 
 #### 1.三个入口怎么选
 
-BypassPro 5.1 主要有四个使用入口：
+BypassPro 5.2 主要有四个使用入口：
 
 
 | 入口                                 | 位置                      | 适合场景                     | 配置                            |
@@ -808,15 +822,19 @@ profiles:
 
 AutoScan 触发条件：
 
-- 监听 Proxy 响应。
+- 先在 Dashboard 勾选 `AutoScan`，默认关闭。
+- 开启后监听新经过 Proxy 的响应，不会回扫已有历史记录；Repeater 等其他工具中的请求需要通过右键菜单送入。
 - 响应状态码为 `401` 或 `403` 时触发。
-- 静态资源会被过滤，避免扫描图片、JS、CSS、字体等无意义资源。
+- 按 `profiles.auto_access_bypass.ignore_extensions` 过滤静态资源，默认包括图片、JS、CSS、字体等后缀。
+
+AutoScan 会根据代理流量自动触发并发送变体请求。若 Dashboard 没有记录，先检查“计划”计数是否增加：增加说明已生成扫描任务。默认展示“信号与错误”，可切换“全部结果 / 错误 / 已过滤”并搜索 URL 或原因。结果是插件发送的变体记录。
 
 Dashboard 入表逻辑：
 
 - 插件会对原请求生成一批变体并重放。
-- 变体响应命中候选状态码后，才会进入差异判断。
-- 如果响应相似度低于 `general.similarity_threshold`，或状态码类别发生变化，就会写入 Dashboard。
+- 候选状态码为 `200/206/304/301/302/303/307/308/405/415`，并结合相似度低于 `general.similarity_threshold` 或状态码类别变化判定信号；Ghost 变体还检查已配置的特征。
+- 所有已完成变体记录均保留，非候选标为“已过滤”，失败标为“错误”；`405/415` 仅是解析或方法差异线索。
+- Dashboard 保留最近 5000 条，界面显示已移除的最早记录数量；输入准备队列满时会提示未入队，便于手动重试。
 - `Reason` 列会显示入表原因，例如：
   - `status:403 -> 200`
   - `sim:0.42 < 0.85`
@@ -914,7 +932,12 @@ Manual-WAF 是 5.x 的核心工作台。它不是自动扫描器，而是给你�
   - `Burp`：强制 Burp 发包。
   - `Raw`：强制 Raw Socket。
   - 注意：Raw Socket 不走 Burp 的 Upstream Proxy / SOCKS Proxy。
-6. 点击 `Send`，结果进入右侧 Response 和 History。
+6. 确认顶部“网络目标 Host / Port / HTTPS”，点击 `Send`。本次发送使用独立快照，右侧说明响应对应的版本；继续编辑会显示响应属于此前版本。
+7. `Cancel` 取消等待并忽略晚到结果；底层请求可能仍在结束。双击 History 恢复完整快照，单击只选中条目。载入新请求前如有未发送修改，会提示是否替换。
+
+推荐先点击“重发原请求”，确认基线，再点击“恢复原请求”，应用一个变换并 Send。重发不会覆盖编辑器中的变体；右侧可切换“基线响应 / 当前响应”，查看状态码、长度和正文相似度。网络目标、发送方式或跳转设置不同时会提示重发，不直接作同条件比较。请求上方显示变换顺序，撤销、重做和恢复同步更新；UTF-16 等变换的配套 Header 和长度调整仍算一次操作。
+
+常用选区工具在无选区时禁用并提示先选中文本；底部显示选区字节数，变换后显示字节数变化和撤销提示。等长 Body 修改也会被差异摘要识别。
 
 选区规则：
 

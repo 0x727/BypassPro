@@ -4,6 +4,7 @@ import Main.ghostbits.GhostBitsEngine;
 import Main.ghostbits.GhostBitsCodec;
 import Main.ghostbits.GhostBitsRule;
 import Main.ghostbits.RawSocketSender;
+import Main.ghostbits.ParserPreview;
 import burp.*;
 
 import javax.swing.*;
@@ -26,6 +27,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Base64;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Random;
 import java.util.Stack;
@@ -53,9 +55,38 @@ public class ManualWafPanel extends JPanel implements IMessageEditorController {
     private IHttpService currentHttpService;
     private byte[] currentResponseBytes = new byte[0];
     private byte[] originalRequest = new byte[0];
+    private IHttpService originalHttpService;
+    private byte[] capturedResponseBytes = new byte[0];
+    private byte[] baselineResponseBytes = new byte[0];
+    private byte[] baselineDisplayedRequestBytes = new byte[0];
+    private byte[] currentDisplayedRequestBytes = new byte[0];
+    private IHttpService baselineHttpService;
+    private SendRun baselineRun;
+    private String baselineCheckText = I18n.t("baseline.not_checked");
+    private String currentComparisonText = "";
+    private String currentResponseSteps = "";
+    private JComboBox<String> responseChoice;
+    private JLabel baselineStatusLabel;
+    private JLabel responseComparisonLabel;
+    private JLabel operationSequenceLabel;
+    private JButton replayOriginalBtn;
+    private JButton restoreOriginalBtn;
+    private JToggleButton historyToggle;
+    private JPanel baselineDetails;
 
-    private final Stack<byte[]> undoStack = new Stack<>();
-    private final Stack<byte[]> redoStack = new Stack<>();
+    private final Stack<RequestState> undoStack = new Stack<>();
+    private final Stack<RequestState> redoStack = new Stack<>();
+    private List<String> transformations = new ArrayList<>();
+    private byte[] transformationBytes = new byte[0];
+
+    private static final class RequestState {
+        final byte[] bytes;
+        final List<String> transformations;
+        RequestState(byte[] bytes, List<String> transformations) {
+            this.bytes = bytes.clone();
+            this.transformations = new ArrayList<>(transformations);
+        }
+    }
 
     private JTextField hostField;
     private JTextField portField;
@@ -67,8 +98,41 @@ public class ManualWafPanel extends JPanel implements IMessageEditorController {
     private JButton undoBtn;
     private JButton redoBtn;
     private JLabel statusLabel;
-    private volatile boolean isCancelled = false;
-    private volatile Thread sendThread = null;
+    private volatile SendRun activeSend;
+    private byte[] lastSubmittedRequest = new byte[0];
+    private byte[] responseRequestBytes = new byte[0];
+    private JLabel responseContextLabel;
+    private JLabel scopeLabel;
+    private final List<JButton> selectionButtons = new ArrayList<>();
+
+    private static final class SendRun {
+        final IHttpService service;
+        final byte[] editorBytes;
+        final byte[] wireBytes;
+        final boolean raw;
+        final boolean followRedirect;
+        final int maxRedirects;
+        final boolean baseline;
+        final String steps;
+        final IHttpRequestResponse reference;
+        final boolean referenceIsReplay;
+        final long startNs = System.nanoTime();
+        volatile boolean cancelled;
+        Thread thread;
+        SendRun(IHttpService service, byte[] editor, byte[] wire, boolean raw, boolean follow, int max,
+                boolean baseline, String steps, IHttpRequestResponse reference, boolean referenceIsReplay) {
+            this.service = service;
+            this.editorBytes = editor.clone();
+            this.wireBytes = wire.clone();
+            this.raw = raw;
+            this.followRedirect = follow && !raw;
+            this.maxRedirects = max;
+            this.baseline = baseline;
+            this.steps = steps;
+            this.reference = reference;
+            this.referenceIsReplay = referenceIsReplay;
+        }
+    }
     private JLabel inspectorRequestLineLabel;
     private JLabel inspectorMetaLabel;
     private JLabel inspectorFlagsLabel;
@@ -76,6 +140,8 @@ public class ManualWafPanel extends JPanel implements IMessageEditorController {
     private JLabel inspectorDiffLabel;
     private JLabel ghostSelectionFoldLabel;
     private JLabel ghostPreviewRiskLabel;
+    private String parserPreviewName, parserPreviewPayload;
+    private byte[] parserPreviewBytes;
     private Timer inspectorTimer;
     private byte[] lastInspectorBytes = new byte[0];
     private byte[] lastInspectorSelectionBytes = new byte[0];
@@ -117,25 +183,70 @@ public class ManualWafPanel extends JPanel implements IMessageEditorController {
         mainSplit.setResizeWeight(0.5);
 
         JPanel requestPanel = new JPanel(new BorderLayout());
+        requestPanel.setPreferredSize(new Dimension(500, 0));
+        requestPanel.setMinimumSize(new Dimension(180, 0));
         requestViewer = Utils.callbacks.createMessageEditor(this, true);
         requestPanel.add(requestViewer.getComponent(), BorderLayout.CENTER);
+        operationSequenceLabel = new JLabel(I18n.t("manual.steps", I18n.t("manual.steps.original")));
+        JPanel requestHeading = createEditorHeading();
+        requestHeading.add(operationSequenceLabel, BorderLayout.CENTER);
+        requestPanel.add(requestHeading, BorderLayout.NORTH);
 
         JPanel responsePanel = new JPanel(new BorderLayout());
-        responseViewer = Utils.callbacks.createMessageEditor(this, false);
+        responsePanel.setPreferredSize(new Dimension(500, 0));
+        responsePanel.setMinimumSize(new Dimension(180, 0));
+        responseChoice = new JComboBox<>(new String[]{I18n.t("manual.response.latest"), I18n.t("manual.response.baseline")});
+        responseChoice.setPrototypeDisplayValue(I18n.t("manual.response.baseline") + "      ");
+        responseViewer = Utils.callbacks.createMessageEditor(new IMessageEditorController() {
+            public IHttpService getHttpService() { return responseChoice.getSelectedIndex() == 1 ? baselineHttpService : currentHttpService; }
+            public byte[] getRequest() { return responseChoice.getSelectedIndex() == 1 ? baselineDisplayedRequestBytes : currentDisplayedRequestBytes; }
+            public byte[] getResponse() { return responseChoice.getSelectedIndex() == 1 ? baselineResponseBytes : currentResponseBytes; }
+        }, false);
         responsePanel.add(responseViewer.getComponent(), BorderLayout.CENTER);
+        responseContextLabel = new JLabel(I18n.t("manual.response.none_short"));
+        responseContextLabel.setToolTipText(I18n.t("manual.response.empty"));
+        JPanel responseHeading = createEditorHeading();
+        responseChoice.addActionListener(e -> showSelectedResponse());
+        responseHeading.add(responseChoice, BorderLayout.WEST);
+        responseHeading.add(responseContextLabel, BorderLayout.CENTER);
+        baselineStatusLabel = new JLabel(baselineCheckText);
+        baselineDetails = new JPanel();
+        baselineDetails.setLayout(new BoxLayout(baselineDetails, BoxLayout.Y_AXIS));
+        baselineDetails.setBorder(new EmptyBorder(3, 8, 3, 8));
+        baselineStatusLabel.setAlignmentX(Component.LEFT_ALIGNMENT);
+        baselineDetails.add(baselineStatusLabel);
+        responseComparisonLabel = new JLabel();
+        responseComparisonLabel.setAlignmentX(Component.LEFT_ALIGNMENT);
+        responseComparisonLabel.setVisible(false);
+        baselineDetails.add(responseComparisonLabel);
+        baselineDetails.setVisible(false);
+        responsePanel.add(responseHeading, BorderLayout.NORTH);
 
         mainSplit.setLeftComponent(requestPanel);
         mainSplit.setRightComponent(responsePanel);
+        JPanel exchangePanel = new JPanel(new BorderLayout());
+        exchangePanel.add(mainSplit, BorderLayout.CENTER);
+        exchangePanel.add(baselineDetails, BorderLayout.SOUTH);
 
         // Bottom: Tools | History
         JSplitPane bottomSplit = new JSplitPane(JSplitPane.HORIZONTAL_SPLIT);
         bottomSplit.setResizeWeight(0.6);
-        bottomSplit.setLeftComponent(createBypassToolsPanel());
-        bottomSplit.setRightComponent(createHistoryPanel());
+        JPanel toolsPanel = createBypassToolsPanel();
+        toolsPanel.setPreferredSize(new Dimension(600, 200));
+        toolsPanel.setMinimumSize(new Dimension(300, 100));
+        bottomSplit.setLeftComponent(toolsPanel);
+        JPanel historyPanel = createHistoryPanel();
+        historyPanel.setPreferredSize(new Dimension(340, 200));
+        bottomSplit.setRightComponent(historyPanel);
+        historyToggle.addActionListener(e -> {
+            historyPanel.setVisible(historyToggle.isSelected());
+            bottomSplit.setDividerSize(historyToggle.isSelected() ? 8 : 0);
+            bottomSplit.setDividerLocation(historyToggle.isSelected() ? 0.65 : 1.0);
+        });
         bottomSplit.setPreferredSize(new Dimension(0, 200));
 
         JSplitPane verticalSplit = new JSplitPane(JSplitPane.VERTICAL_SPLIT);
-        verticalSplit.setTopComponent(mainSplit);
+        verticalSplit.setTopComponent(exchangePanel);
         verticalSplit.setBottomComponent(bottomSplit);
         verticalSplit.setResizeWeight(0.76);
 
@@ -146,27 +257,50 @@ public class ManualWafPanel extends JPanel implements IMessageEditorController {
         setupShortcuts();
         startRequestInspectorTimer();
         updateUndoRedoButtons();
+        replayOriginalBtn.setEnabled(false);
+        restoreOriginalBtn.setEnabled(false);
+        updateTransformationLabel();
+    }
+
+    private JPanel createEditorHeading() {
+        JPanel heading = new JPanel(new BorderLayout(8, 0)) {
+            @Override
+            public Dimension getPreferredSize() {
+                Dimension preferred = super.getPreferredSize();
+                int controlHeight = responseChoice == null ? 0 : responseChoice.getPreferredSize().height;
+                Insets padding = getInsets();
+                preferred.height = Math.max(controlHeight, operationSequenceLabel.getPreferredSize().height)
+                        + padding.top + padding.bottom;
+                return preferred;
+            }
+        };
+        heading.setBorder(new EmptyBorder(4, 6, 4, 6));
+        return heading;
     }
 
     private JPanel createStatusPanel() {
-        JPanel statusPanel = new JPanel(new FlowLayout(FlowLayout.LEFT, 10, 2));
-        statusPanel.setBorder(BorderFactory.createEtchedBorder());
+        JPanel statusPanel = new JPanel(new BorderLayout(12, 0));
+        statusPanel.setBorder(new EmptyBorder(4, 8, 4, 8));
         statusLabel = new JLabel(I18n.t("status.ready"));
         statusLabel.setFont(new Font(Font.MONOSPACED, Font.PLAIN, 12));
-        statusPanel.add(statusLabel);
+        statusPanel.add(statusLabel, BorderLayout.CENTER);
+        scopeLabel = new JLabel(I18n.t("manual.scope.none"));
+        statusPanel.add(scopeLabel, BorderLayout.EAST);
         return statusPanel;
     }
 
     private JPanel createToolbar() {
-        JPanel toolbar = new JPanel(new BorderLayout());
+        JPanel toolbar = new JPanel(new BorderLayout(0, 6));
         toolbar.setBorder(new EmptyBorder(5, 8, 5, 8));
 
-        JPanel left = new JPanel(new FlowLayout(FlowLayout.LEFT, 5, 0));
+        JPanel actions = new WrappingToolbar();
+        JPanel sendActions = new JPanel(new FlowLayout(FlowLayout.LEFT, 5, 0));
+        JPanel editActions = new JPanel(new FlowLayout(FlowLayout.LEFT, 5, 0));
         sendBtn = new JButton("Send");
         sendBtn.setBackground(new Color(255, 102, 51));
         sendBtn.setForeground(Color.WHITE);
         sendBtn.setFocusPainted(false);
-        sendBtn.setToolTipText("Send (Auto: 含非 ASCII -> Raw, 否则 Burp)");
+        sendBtn.setToolTipText(I18n.t("manual.send.auto_tip"));
         sendBtn.addActionListener(e -> sendRequest());
 
         sendDropdownBtn = new JButton("▾");
@@ -174,7 +308,7 @@ public class ManualWafPanel extends JPanel implements IMessageEditorController {
         sendDropdownBtn.setForeground(Color.WHITE);
         sendDropdownBtn.setFocusPainted(false);
         sendDropdownBtn.setMargin(new Insets(2, 4, 2, 4));
-        sendDropdownBtn.setToolTipText("选择发送模式");
+        sendDropdownBtn.setToolTipText(I18n.t("manual.send.choose_mode"));
         sendDropdownBtn.addActionListener(e -> showSendModeMenu(sendDropdownBtn));
 
         cancelBtn = new JButton("Cancel");
@@ -183,47 +317,91 @@ public class ManualWafPanel extends JPanel implements IMessageEditorController {
 
         undoBtn = new JButton("←");
         redoBtn = new JButton("→");
-        JButton resetBtn = new JButton("Reset");
-        undoBtn.setToolTipText("撤销");
-        redoBtn.setToolTipText("恢复");
-        resetBtn.setToolTipText("恢复到原始请求");
+        restoreOriginalBtn = new JButton(I18n.t("manual.restore_original"));
+        replayOriginalBtn = new JButton(I18n.t("manual.replay_original"));
+        replayOriginalBtn.setToolTipText(I18n.t("manual.replay_original.tip"));
+        replayOriginalBtn.addActionListener(e -> sendRequest(true));
+        undoBtn.setToolTipText(I18n.t("manual.undo"));
+        redoBtn.setToolTipText(I18n.t("manual.redo"));
+        restoreOriginalBtn.setToolTipText(I18n.t("manual.reset"));
         undoBtn.addActionListener(e -> undo());
         redoBtn.addActionListener(e -> redo());
-        resetBtn.addActionListener(e -> reset());
+        restoreOriginalBtn.addActionListener(e -> reset());
 
         followRedirectCheckBox = new JCheckBox("Follow Redirect");
-        followRedirectCheckBox.setToolTipText("自动跟随 301/302/303/307/308 跳转");
+        followRedirectCheckBox.setToolTipText(I18n.t("manual.follow_redirect"));
 
-        left.add(sendBtn);
-        left.add(sendDropdownBtn);
-        left.add(cancelBtn);
-        left.add(Box.createHorizontalStrut(10));
-        left.add(undoBtn);
-        left.add(redoBtn);
-        left.add(resetBtn);
-        left.add(Box.createHorizontalStrut(10));
-        left.add(followRedirectCheckBox);
+        sendActions.add(sendBtn);
+        sendActions.add(sendDropdownBtn);
+        sendActions.add(replayOriginalBtn);
+        sendActions.add(cancelBtn);
+        editActions.add(undoBtn);
+        editActions.add(redoBtn);
+        editActions.add(restoreOriginalBtn);
+        actions.add(sendActions);
+        actions.add(editActions);
+        historyToggle = new JToggleButton(I18n.t("manual.history.toggle"), true);
+        actions.add(historyToggle);
 
-        JPanel right = new JPanel(new FlowLayout(FlowLayout.RIGHT, 5, 0));
-        right.add(new JLabel(I18n.t("label.host")));
+        JPanel target = new JPanel(new GridBagLayout());
+        GridBagConstraints cell = new GridBagConstraints();
+        cell.gridy = 0;
+        cell.insets = new Insets(0, 0, 0, 6);
+        cell.anchor = GridBagConstraints.WEST;
+        target.add(new JLabel("Host:"), cell);
         hostField = new JTextField(16);
-        right.add(hostField);
-        right.add(new JLabel(I18n.t("label.port")));
+        hostField.setToolTipText(I18n.t("manual.network_target"));
+        cell.weightx = 1;
+        cell.fill = GridBagConstraints.HORIZONTAL;
+        target.add(hostField, cell);
+        cell.weightx = 0;
+        cell.fill = GridBagConstraints.NONE;
+        target.add(new JLabel(I18n.t("label.port")), cell);
         portField = new JTextField(5);
-        right.add(portField);
+        target.add(portField, cell);
         httpsCheckBox = new JCheckBox("HTTPS");
-        right.add(httpsCheckBox);
+        target.add(httpsCheckBox, cell);
+        target.add(followRedirectCheckBox, cell);
 
-        toolbar.add(left, BorderLayout.WEST);
-        toolbar.add(right, BorderLayout.EAST);
+        toolbar.add(target, BorderLayout.NORTH);
+        toolbar.add(actions, BorderLayout.CENTER);
         return toolbar;
+    }
+
+    private final class WrappingToolbar extends JPanel {
+        WrappingToolbar() { super(new FlowLayout(FlowLayout.LEFT, 6, 3)); }
+
+        @Override
+        public Dimension getPreferredSize() {
+            Dimension preferred = super.getPreferredSize();
+            int width = ManualWafPanel.this.getWidth();
+            if (getParent() != null) {
+                Insets padding = getParent().getInsets();
+                width -= padding.left + padding.right;
+            }
+            if (width <= 0) return preferred;
+            int rowWidth = 0, rowHeight = 0, height = 6;
+            for (Component component : getComponents()) {
+                if (!component.isVisible()) continue;
+                Dimension item = component.getPreferredSize();
+                if (rowWidth > 0 && rowWidth + 6 + item.width > width - 12) {
+                    height += rowHeight + 3;
+                    rowWidth = 0;
+                    rowHeight = 0;
+                }
+                rowWidth += (rowWidth == 0 ? 0 : 6) + item.width;
+                rowHeight = Math.max(rowHeight, item.height);
+            }
+            preferred.height = height + rowHeight;
+            return preferred;
+        }
     }
 
     private void showSendModeMenu(Component anchor) {
         JPopupMenu menu = new JPopupMenu();
 
         JRadioButtonMenuItem auto = new JRadioButtonMenuItem(
-                "Auto (含非 ASCII -> Raw)", senderMode == SenderMode.AUTO);
+                I18n.t("manual.send.auto"), senderMode == SenderMode.AUTO);
         auto.addActionListener(e -> setSenderMode(SenderMode.AUTO));
 
         JRadioButtonMenuItem burp = new JRadioButtonMenuItem(
@@ -243,7 +421,7 @@ public class ManualWafPanel extends JPanel implements IMessageEditorController {
         menu.add(burp);
         menu.add(raw);
         menu.addSeparator();
-        JMenuItem hint = new JMenuItem("Raw 模式直连目标，不走 Burp 上游代理，禁用证书校验（CTF/测试）");
+        JMenuItem hint = new JMenuItem(I18n.t("manual.send.raw_hint"));
         hint.setEnabled(false);
         menu.add(hint);
 
@@ -252,6 +430,7 @@ public class ManualWafPanel extends JPanel implements IMessageEditorController {
 
     private void setSenderMode(SenderMode mode) {
         this.senderMode = mode;
+        updateRedirectAvailability();
         if (sendBtn != null) {
             switch (mode) {
                 case BURP:
@@ -311,23 +490,38 @@ public class ManualWafPanel extends JPanel implements IMessageEditorController {
         return -1;
     }
 
+    private void updateRedirectAvailability() {
+        if (followRedirectCheckBox == null) return;
+        boolean raw = shouldUseRawSocket(getRequestBytes());
+        followRedirectCheckBox.setEnabled(!raw);
+        followRedirectCheckBox.setToolTipText(I18n.t(raw ? "manual.redirect.raw" : "manual.redirect.same_origin"));
+    }
+
     private void cancelRequest() {
-        isCancelled = true;
-        if (sendThread != null) {
-            sendThread.interrupt();
-        }
-        SwingUtilities.invokeLater(() -> {
-            if (sendBtn != null) {
-                sendBtn.setEnabled(true);
-                setSenderMode(senderMode);
-            }
-            if (cancelBtn != null) {
-                cancelBtn.setEnabled(false);
-            }
-            if (statusLabel != null) {
-                statusLabel.setText(I18n.t("status.cancelled"));
-            }
-        });
+        SendRun run = activeSend;
+        if (run == null) return;
+        run.cancelled = true;
+        activeSend = null;
+        if (run.thread != null) run.thread.interrupt();
+        restoreSendControls();
+        statusLabel.setText(I18n.t("manual.cancel.detached"));
+        responseContextLabel.setText(I18n.t("manual.cancel.detached"));
+    }
+
+    private boolean isCurrent(SendRun run) {
+        return activeSend == run && !run.cancelled;
+    }
+
+    private void restoreSendControls() {
+        sendBtn.setEnabled(true);
+        replayOriginalBtn.setEnabled(originalRequest.length > 0);
+        setSenderMode(senderMode);
+        cancelBtn.setEnabled(false);
+    }
+
+    public void dispose() {
+        cancelRequest();
+        if (inspectorTimer != null) inspectorTimer.stop();
     }
 
     private void setupShortcuts() {
@@ -395,14 +589,14 @@ public class ManualWafPanel extends JPanel implements IMessageEditorController {
                 BorderFactory.createMatteBorder(1, 0, 0, 0, separatorColor),
                 new EmptyBorder(5, 6, 5, 6)));
 
-        JPanel currentTop = new JPanel(new FlowLayout(FlowLayout.LEFT, 12, 0));
+        JPanel currentTop = new JPanel(new GridLayout(1, 2, 12, 0));
         currentTop.add(inspectorRequestLineLabel);
         currentTop.add(inspectorMetaLabel);
 
-        JPanel currentBottom = new JPanel(new FlowLayout(FlowLayout.LEFT, 12, 0));
-        currentBottom.add(inspectorFlagsLabel);
-        currentBottom.add(inspectorHintsLabel);
-        currentBottom.add(inspectorDiffLabel);
+        JPanel currentBottom = new JPanel(new BorderLayout(12, 0));
+        currentBottom.add(inspectorFlagsLabel, BorderLayout.WEST);
+        currentBottom.add(inspectorHintsLabel, BorderLayout.CENTER);
+        currentBottom.add(inspectorDiffLabel, BorderLayout.EAST);
 
         current.add(currentTop);
         current.add(currentBottom);
@@ -427,14 +621,12 @@ public class ManualWafPanel extends JPanel implements IMessageEditorController {
         targetPanel.add(targetLabel);
 
         ButtonGroup targetGroup = new ButtonGroup();
-        String[][] targets = {
-                { "光标处插入", "SELECTION" }, { "Path 末尾", "SUFFIX" }, { "每段前", "SEG_PREFIX" },
-                { "每段后", "SEG_SUFFIX" }, { "字符间", "INTERLEAVE" }, { "替换空格", "REPLACE_SPACE" }
-        };
-        for (String[] t : targets) {
-            JRadioButton rb = new JRadioButton(t[0], "SELECTION".equals(t[1]));
+        String[] targets = {"SELECTION", "SUFFIX", "SEG_PREFIX", "SEG_SUFFIX", "INTERLEAVE", "REPLACE_SPACE"};
+        for (String target : targets) {
+            String labelKey = "tooltip.noise." + target.toLowerCase(Locale.ROOT) + ".title";
+            JRadioButton rb = new JRadioButton(I18n.t(labelKey), "SELECTION".equals(target));
             rb.setFont(new Font(Font.SANS_SERIF, Font.PLAIN, 10));
-            final String val = t[1];
+            final String val = target;
             rb.setToolTipText(noiseTargetTooltip(val));
             rb.addActionListener(e -> atomTarget = AtomTarget.valueOf(val));
             targetGroup.add(rb);
@@ -467,19 +659,19 @@ public class ManualWafPanel extends JPanel implements IMessageEditorController {
         JPanel payloadsPanel = createToolCategoryPanel();
         addToolRow(payloadsPanel, "Traversal",
                 toolButton("....//", tooltip("Traversal: ....//",
-                        "选区: ../ -> ....//",
-                        "无选区: 替换 path 中的 ../",
-                        "用途: 绕过只匹配标准 ../ 的规则"),
+                        I18n.t("tooltip.traversal.selection", "../", "....//"),
+                        I18n.t("tooltip.traversal.no_selection", "../"),
+                        I18n.t("tooltip.path.standard_traversal")),
                         () -> replaceInSelectionOrPath(s -> s.replace("../", "....//"))),
                 toolButton("..%252f", tooltip("Traversal: ..%252f",
-                        "选区: ../ -> ..%252f",
-                        "无选区: 替换 path 中的 ../",
-                        "用途: 双重 URL decode 后恢复 /"),
+                        I18n.t("tooltip.traversal.selection", "../", "..%252f"),
+                        I18n.t("tooltip.traversal.no_selection", "../"),
+                        I18n.t("tooltip.path.double_decode")),
                         () -> replaceInSelectionOrPath(s -> s.replace("../", "..%252f"))),
                 toolButton("..%c0%af", tooltip("Traversal: ..%c0%af",
-                        "选区: ../ -> ..%c0%af",
-                        "无选区: 替换 path 中的 ../",
-                        "用途: 历史 overlong UTF-8 slash 绕过思路"),
+                        I18n.t("tooltip.traversal.selection", "../", "..%c0%af"),
+                        I18n.t("tooltip.traversal.no_selection", "../"),
+                        I18n.t("tooltip.path.overlong")),
                         () -> replaceInSelectionOrPath(s -> s.replace("../", "..%c0%af"))),
                 toolButton(".%u002e", tooltip("Traversal: .%u002e",
                         I18n.t("tooltip.traversal.selection", "../", ".%u002e/"),
@@ -493,106 +685,106 @@ public class ManualWafPanel extends JPanel implements IMessageEditorController {
                         () -> replaceInSelectionOrPath(s -> s.replace("../", "..\\\\"))));
         addToolRow(payloadsPanel, "Suffix",
                 toolButton(".js", tooltip("Suffix: .js",
-                        "选区: 在选区末尾追加 .js",
-                        "无选区: 追加到 request path 末尾",
-                        "用途: 静态资源伪装"),
+                        I18n.t("tooltip.path.suffix_selection", ".js"),
+                        I18n.t("tooltip.path.append_end"),
+                        I18n.t("tooltip.path.static_suffix")),
                         () -> appendPathSuffix(".js")),
                 toolButton(".css", tooltip("Suffix: .css",
-                        "选区: 在选区末尾追加 .css",
-                        "无选区: 追加到 request path 末尾",
-                        "用途: 静态资源伪装"),
+                        I18n.t("tooltip.path.suffix_selection", ".css"),
+                        I18n.t("tooltip.path.append_end"),
+                        I18n.t("tooltip.path.static_suffix")),
                         () -> appendPathSuffix(".css")),
                 toolButton(";.js", tooltip("Suffix: ;.js",
-                        "选区: 在选区末尾追加 ;.js",
-                        "无选区: 追加到 request path 末尾",
-                        "用途: 分号路径参数 + 静态资源伪装"),
+                        I18n.t("tooltip.path.suffix_selection", ";.js"),
+                        I18n.t("tooltip.path.append_end"),
+                        I18n.t("tooltip.path.semicolon_static")),
                         () -> appendPathSuffix(";.js")),
                 toolButton("/.", tooltip("Suffix: /.",
-                        "选区: 在选区末尾追加 /.",
-                        "无选区: 追加到 request path 末尾",
-                        "用途: 路径规范化差异"),
+                        I18n.t("tooltip.path.suffix_selection", "/."),
+                        I18n.t("tooltip.path.append_end"),
+                        I18n.t("tooltip.path.normalization")),
                         () -> appendPathSuffix("/.")),
                 toolButton("?", tooltip("Suffix: ?",
-                        "选区: 在选区末尾追加 ?",
-                        "无选区: 追加到 request path 末尾",
-                        "用途: query 边界混淆"),
+                        I18n.t("tooltip.path.suffix_selection", "?"),
+                        I18n.t("tooltip.path.append_end"),
+                        I18n.t("tooltip.path.query_boundary")),
                         () -> appendPathSuffix("?")));
         addToolRow(payloadsPanel, "Segment",
                 toolButton("//", tooltip("Segment: //",
-                        "选区: 在选区前加 //",
-                        "无选区: 给每个 path segment 加 //",
-                        "用途: 双斜杠规范化 / path collapse 差异"),
+                        I18n.t("tooltip.path.prefix_selection", "//"),
+                        I18n.t("tooltip.path.prefix_default", "//"),
+                        I18n.t("tooltip.path.double_slash")),
                         () -> prefixEachPathSegment("//")),
                 toolButton("/./", tooltip("Segment: /./",
-                        "选区: 在选区前加 /./",
-                        "无选区: 给每个 path segment 加 /./",
-                        "用途: 当前目录规范化差异"),
+                        I18n.t("tooltip.path.prefix_selection", "/./"),
+                        I18n.t("tooltip.path.prefix_default", "/./"),
+                        I18n.t("tooltip.path.current_directory")),
                         () -> prefixEachPathSegment("/./")),
                 toolButton("/%2e/", tooltip("Segment: /%2e/",
-                        "选区: 在选区前加 /%2e/",
-                        "无选区: 给每个 path segment 加 /%2e/",
-                        "用途: 编码当前目录规范化差异"),
+                        I18n.t("tooltip.path.prefix_selection", "/%2e/"),
+                        I18n.t("tooltip.path.prefix_default", "/%2e/"),
+                        I18n.t("tooltip.path.encoded_directory")),
                         () -> prefixEachPathSegment("/%2e/")),
                 toolButton(";/", tooltip("Segment: ;/",
-                        "选区: 在选区前加 ;/",
-                        "无选区: 给每个 path segment 加 ;/",
-                        "用途: 分号路径参数 / segment 解析差异"),
+                        I18n.t("tooltip.path.prefix_selection", ";/"),
+                        I18n.t("tooltip.path.prefix_default", ";/"),
+                        I18n.t("tooltip.path.semicolon_segment")),
                         () -> prefixEachPathSegment(";/")),
                 toolButton("./", tooltip("Segment: ./",
-                        "选区: 在选区前加 ./",
-                        "无选区: 给每个 path segment 加 ./",
-                        "用途: 当前目录规范化差异"),
+                        I18n.t("tooltip.path.prefix_selection", "./"),
+                        I18n.t("tooltip.path.prefix_default", "./"),
+                        I18n.t("tooltip.path.current_directory")),
                         () -> prefixEachPathSegment("./")),
                 toolButton(".;/", tooltip("Segment: .;/",
-                        "选区: 在选区前加 .;/",
-                        "无选区: 给每个 path segment 加 .;/",
-                        "用途: 点 + 分号组合解析差异"),
+                        I18n.t("tooltip.path.prefix_selection", ".;/"),
+                        I18n.t("tooltip.path.prefix_default", ".;/"),
+                        I18n.t("tooltip.path.dot_semicolon")),
                         () -> prefixEachPathSegment(".;/")),
                 toolButton("%2e/", tooltip("Segment: %2e/",
-                        "选区: 在选区前加 %2e/",
-                        "无选区: 给每个 path segment 加 %2e/",
-                        "用途: 编码点前缀"),
+                        I18n.t("tooltip.path.prefix_selection", "%2e/"),
+                        I18n.t("tooltip.path.prefix_default", "%2e/"),
+                        I18n.t("tooltip.path.encoded_dot")),
                         () -> prefixEachPathSegment("%2e/")),
                 toolButton("%252e/", tooltip("Segment: %252e/",
-                        "选区: 在选区前加 %252e/",
-                        "无选区: 给每个 path segment 加 %252e/",
-                        "用途: 双重编码点前缀"),
+                        I18n.t("tooltip.path.prefix_selection", "%252e/"),
+                        I18n.t("tooltip.path.prefix_default", "%252e/"),
+                        I18n.t("tooltip.path.double_encoded_dot")),
                         () -> prefixEachPathSegment("%252e/")),
                 toolButton("..%5c/", tooltip("Segment: ..%5c/",
-                        "选区: 在选区前加 ..%5c/",
-                        "无选区: 给每个 path segment 加 ..%5c/",
-                        "用途: 编码反斜杠路径差异"),
+                        I18n.t("tooltip.path.prefix_selection", "..%5c/"),
+                        I18n.t("tooltip.path.prefix_default", "..%5c/"),
+                        I18n.t("tooltip.path.encoded_backslash")),
                         () -> prefixEachPathSegment("..%5c/")));
         addToolRow(payloadsPanel, "Boundary",
                 toolButton(";", tooltip("Boundary: ;",
-                        "选区: 在选区末尾追加 ;",
-                        "无选区: 给每个 path segment 追加 ;",
-                        "用途: 矩阵参数 / 分号边界"),
+                        I18n.t("tooltip.path.suffix_selection", ";"),
+                        I18n.t("tooltip.path.append_default", ";"),
+                        I18n.t("tooltip.path.matrix_boundary")),
                         () -> appendEachPathSegment(";")),
                 toolButton(".;", tooltip("Boundary: .;",
-                        "选区: 在选区末尾追加 .;",
-                        "无选区: 给每个 path segment 追加 .;",
-                        "用途: 点分号解析差异"),
+                        I18n.t("tooltip.path.suffix_selection", ".;"),
+                        I18n.t("tooltip.path.append_default", ".;"),
+                        I18n.t("tooltip.path.dot_semicolon_parse")),
                         () -> appendEachPathSegment(".;")),
                 toolButton("..;", tooltip("Boundary: ..;",
-                        "选区: 在选区末尾追加 ..;",
-                        "无选区: 给每个 path segment 追加 ..;",
-                        "用途: 点点分号解析差异"),
+                        I18n.t("tooltip.path.suffix_selection", "..;"),
+                        I18n.t("tooltip.path.append_default", "..;"),
+                        I18n.t("tooltip.path.double_dot_semicolon")),
                         () -> appendEachPathSegment("..;")),
                 toolButton(";param=1", tooltip("Boundary: ;param=1",
-                        "选区: 在选区末尾追加 ;param=1",
-                        "无选区: 给每个 path segment 追加 ;param=1",
-                        "用途: 矩阵参数混淆"),
+                        I18n.t("tooltip.path.suffix_selection", ";param=1"),
+                        I18n.t("tooltip.path.append_default", ";param=1"),
+                        I18n.t("tooltip.path.matrix_params")),
                         () -> appendEachPathSegment(";param=1")),
                 toolButton(";jsessionid=1", tooltip("Boundary: ;jsessionid=1",
-                        "选区: 在选区末尾追加 ;jsessionid=1",
-                        "无选区: 给每个 path segment 追加 ;jsessionid=1",
-                        "用途: Java session path 参数"),
+                        I18n.t("tooltip.path.suffix_selection", ";jsessionid=1"),
+                        I18n.t("tooltip.path.append_default", ";jsessionid=1"),
+                        I18n.t("tooltip.path.java_session")),
                         () -> appendEachPathSegment(";jsessionid=1")),
                 toolButton(";foo=bar", tooltip("Boundary: ;foo=bar",
-                        "选区: 在选区末尾追加 ;foo=bar",
-                        "无选区: 给每个 path segment 追加 ;foo=bar",
-                        "用途: 泛化 matrix param / 分号参数解析差异"),
+                        I18n.t("tooltip.path.suffix_selection", ";foo=bar"),
+                        I18n.t("tooltip.path.append_default", ";foo=bar"),
+                        I18n.t("tooltip.path.semicolon_params")),
                         () -> appendEachPathSegment(";foo=bar")));
         payloadsPanel.setAlignmentX(Component.LEFT_ALIGNMENT);
         content.add(payloadsPanel);
@@ -706,13 +898,13 @@ public class ManualWafPanel extends JPanel implements IMessageEditorController {
     private JPanel createDataEncodingPanel() {
         JPanel p = createToolCategoryPanel();
         addToolRow(p, "URL",
-                toolButton("URL Encode", this::urlEncode),
-                toolButton("Path Encode", this::pathUrlEncode),
-                toolButton("Double URL", this::doubleUrlEncode),
-                toolButton("Mixed Encode", this::mixedUrlEncode),
-                toolButton("Unicode 转义", this::toUnicodeEscape));
+                selectionButton("URL Encode", this::urlEncode),
+                selectionButton("Path Encode", this::pathUrlEncode),
+                selectionButton("Double URL", this::doubleUrlEncode),
+                selectionButton("Mixed Encode", this::mixedUrlEncode),
+                selectionButton("Unicode 转义", this::toUnicodeEscape));
         addToolRow(p, "Base64",
-                toolButton("Base64 Encode", this::base64Encode));
+                selectionButton("Base64 Encode", this::base64Encode));
         addToolRow(p, "Unicode Encoding",
                 toolButton("UTF-16", () -> encodeBodyWithCharset("UTF-16")),
                 toolButton("UTF-16BE", () -> encodeBodyWithCharset("UTF-16BE")),
@@ -732,13 +924,13 @@ public class ManualWafPanel extends JPanel implements IMessageEditorController {
     private JPanel createUnicodeNormalizationPanel() {
         JPanel p = createToolCategoryPanel();
         addToolRow(p, "Unicode",
-                toolButton("Fullwidth", this::toFullwidth),
-                toolButton("Homoglyph", this::toHomoglyph),
-                toolButton("Zero Width", this::insertZeroWidth));
+                selectionButton("Fullwidth", this::toFullwidth),
+                selectionButton("Homoglyph", this::toHomoglyph),
+                selectionButton("Zero Width", this::insertZeroWidth));
         addToolRow(p, "Case",
-                toolButton("Upper", this::toUpper),
-                toolButton("Lower", this::toLower),
-                toolButton("Random", this::toRandomCase));
+                selectionButton("Upper", this::toUpper),
+                selectionButton("Lower", this::toLower),
+                selectionButton("Random", this::toRandomCase));
         return wrapToolPanel(p);
     }
 
@@ -751,20 +943,20 @@ public class ManualWafPanel extends JPanel implements IMessageEditorController {
 
         JPanel p = createToolCategoryPanel();
         addToolRow(p, "Ghost Encode",
-                toolButton("Minimal", () -> encodeGhostSelection(GhostBitsCodec.EncodeStrategy.MINIMAL)),
-                toolButton("Full", () -> encodeGhostSelection(GhostBitsCodec.EncodeStrategy.FULL)),
-                toolButton("Letters", () -> encodeGhostSelection(GhostBitsCodec.EncodeStrategy.LETTERS)),
-                toolButton("Digits", () -> encodeGhostSelection(GhostBitsCodec.EncodeStrategy.DIGITS)),
-                toolButton("Symbols", () -> encodeGhostSelection(GhostBitsCodec.EncodeStrategy.SYMBOLS)),
-                toolButton("Shuffle", this::randomizeGhostSelection));
+                selectionButton("Minimal", () -> encodeGhostSelection(GhostBitsCodec.EncodeStrategy.MINIMAL)),
+                selectionButton("Full", () -> encodeGhostSelection(GhostBitsCodec.EncodeStrategy.FULL)),
+                selectionButton("Letters", () -> encodeGhostSelection(GhostBitsCodec.EncodeStrategy.LETTERS)),
+                selectionButton("Digits", () -> encodeGhostSelection(GhostBitsCodec.EncodeStrategy.DIGITS)),
+                selectionButton("Symbols", () -> encodeGhostSelection(GhostBitsCodec.EncodeStrategy.SYMBOLS)),
+                selectionButton("Shuffle", this::randomizeGhostSelection));
         ghostFold8BitBtn = createFoldModeToggle("8-bit", GhostBitsCodec.FoldMode.BIT_8, true);
         ghostFold7BitBtn = createFoldModeToggle("7-bit", GhostBitsCodec.FoldMode.BIT_7, false);
         ButtonGroup foldGroup = new ButtonGroup();
         foldGroup.add(ghostFold8BitBtn);
         foldGroup.add(ghostFold7BitBtn);
-        addToolRow(p, "Ghost 还原",
-                toolButton("Preview", this::showFoldPreview),
-                toolButton("Candidates", this::showGhostCandidates),
+        addToolRow(p, "Fold Check",
+                selectionButton("Preview", this::showFoldPreview),
+                selectionButton("Candidates", this::showGhostCandidates),
                 ghostFold8BitBtn, ghostFold7BitBtn);
         addToolRow(p, "Common Payload",
                 toolButton(".%u002e", () -> applyGhostSequence(".%u002e", "Path traversal chain: .%u002e -> ..")),
@@ -781,7 +973,7 @@ public class ManualWafPanel extends JPanel implements IMessageEditorController {
                 toolButton("Jetty %2>", this::applyJettyLooseHexSelection),
                 toolButton("Fullwidth URL", this::applyFullwidthUrlSelection),
                 toolButton("Tomcat %HH", this::applyTomcatSevenBitHexSelection));
-        ghostTemplatePathRow = addTemplateWrapRow(p, "模板",
+        ghostTemplatePathRow = addTemplateWrapRow(p, "Templates",
                 createAllGhostTemplateButtons());
         p.setAlignmentX(Component.LEFT_ALIGNMENT);
         content.add(p);
@@ -865,7 +1057,7 @@ public class ManualWafPanel extends JPanel implements IMessageEditorController {
     }
 
     private String templateButtonText(GhostBitsRule.Template t) {
-        String label = t.getLabel();
+        String label = I18n.t(t.getLabel());
         if (label == null || label.trim().isEmpty()) {
             label = t.getId();
         }
@@ -876,13 +1068,13 @@ public class ManualWafPanel extends JPanel implements IMessageEditorController {
     }
 
     private String ghostTemplateTooltip(GhostBitsRule.Template t) {
-        String label = t.getLabel() == null || t.getLabel().isEmpty() ? t.getId() : t.getLabel();
+        String label = t.getLabel() == null || t.getLabel().isEmpty() ? t.getId() : I18n.t(t.getLabel());
         return tooltip(label,
-                "来自 YAML: profiles.manual_waf_bypass.ghost_bits.templates." + t.getId(),
-                "目标: " + t.getTarget(),
-                "发送: " + ("raw".equalsIgnoreCase(t.getSender()) ? "Raw Socket recommended" : "Burp OK / Raw OK"),
-                "操作: 按模板 target 自动处理；selection 模板需先选中替换位置",
-                "说明: " + (t.getNotes() == null || t.getNotes().isEmpty() ? "-" : t.getNotes()));
+                I18n.t("template.source", t.getId()),
+                I18n.t("template.target", t.getTarget()),
+                I18n.t("template.sender", "raw".equalsIgnoreCase(t.getSender()) ? "Raw Socket recommended" : "Burp OK / Raw OK"),
+                I18n.t("template.action"),
+                I18n.t("template.notes", t.getNotes() == null || t.getNotes().isEmpty() ? "-" : I18n.t(t.getNotes())));
     }
 
     private JPanel addToolRow(JPanel panel, String label, JComponent... items) {
@@ -982,14 +1174,23 @@ public class ManualWafPanel extends JPanel implements IMessageEditorController {
         return I18n.slug(s);
     }
 
+    private JButton selectionButton(String text, Runnable action) {
+        JButton button = toolButton(text, action);
+        button.putClientProperty("selectionTooltip", button.getToolTipText());
+        selectionButtons.add(button);
+        updateSelectionButton(button, false);
+        return button;
+    }
+
+    private void updateSelectionButton(JButton button, boolean selected) {
+        button.setEnabled(selected);
+        String original = (String) button.getClientProperty("selectionTooltip");
+        button.setToolTipText(selected ? original : I18n.t("manual.selection.required") + "\n" + original);
+    }
+
     private JButton toolButton(String text, String tooltip, Runnable action) {
         // text 作为稳定 key，UI 显示用当前语言版本
         String displayText = resolveBtnText(text);
-        // 若 i18n 中为该按钮注册了 tooltip，则优先用 i18n（确保英文模式下也是英文）
-        String i18nTooltip = i18nTooltipFor(text);
-        if (i18nTooltip != null) {
-            tooltip = i18nTooltip;
-        }
         JButton btn = new JButton(displayText) {
             @Override
             public JToolTip createToolTip() {
@@ -998,17 +1199,18 @@ public class ManualWafPanel extends JPanel implements IMessageEditorController {
                 return tip;
             }
         };
-        btn.setMargin(new Insets(0, 7, 0, 7));
+        btn.setMargin(new Insets(3, 7, 3, 7));
         btn.setFont(new Font(Font.SANS_SERIF, Font.PLAIN, 10));
         btn.setFocusPainted(false);
         if (tooltip != null && !tooltip.isEmpty()) {
             btn.setToolTipText(tooltip);
         }
-        Dimension pref = btn.getPreferredSize();
-        btn.setPreferredSize(new Dimension(pref.width, 24));
-        btn.setMaximumSize(new Dimension(Integer.MAX_VALUE, 24));
         btn.addActionListener(e -> {
-            runRequestMutation(action);
+            byte[] before = getRequestBytes().clone();
+            runRequestMutation(action, displayText);
+            byte[] after = getRequestBytes();
+            if (!Arrays.equals(before, after))
+                statusLabel.setText(I18n.t("manual.mutation", displayText, before.length, after.length));
         });
         return btn;
     }
@@ -1025,7 +1227,7 @@ public class ManualWafPanel extends JPanel implements IMessageEditorController {
      * 根据按钮文本（稳定 key，如 "Minimal" / "URL Encode" / "Unicode 转义"）从 I18n 拼接 tooltip。
      * 约定 I18n 中存在 "tooltip.{slug}.title" 和 "tooltip.{slug}.desc" 两条 key。
      * desc 中可包含 \n 用于多行展示。
-     * 任意一条找不到则返回 null，由调用方走旧的 case-switch 兜底。
+     * 未注册时返回 null，由调用方提供通用或当前操作专用的提示。
      */
     private String i18nTooltipFor(String key) {
         String slug = slugifyForI18n(key);
@@ -1082,62 +1284,12 @@ public class ManualWafPanel extends JPanel implements IMessageEditorController {
     }
 
     private String atomTooltip(String atom) {
-        switch (atom) {
-            case "%00":
-                return tooltip("Noise Atom: %00",
-                        "URL 编码的 NUL 字节",
-                        "常用于截断、解析差异、后缀绕过测试",
-                        "位置由上方“Noise 作用方式”决定");
-            case "%09":
-                return tooltip("Noise Atom: %09",
-                        "URL 编码的 Tab 制表符",
-                        "常用于空白字符混淆、关键字分隔、路径解析差异",
-                        "位置由上方“Noise 作用方式”决定");
-            case "%0a":
-                return tooltip("Noise Atom: %0a",
-                        "URL 编码的 LF 换行",
-                        "常用于 CRLF、Header 注入、协议边界测试",
-                        "位置由上方“Noise 作用方式”决定");
-            case "%0d":
-                return tooltip("Noise Atom: %0d",
-                        "URL 编码的 CR 回车",
-                        "通常和 %0a 组合测试 CRLF 注入",
-                        "位置由上方“Noise 作用方式”决定");
-            case "%20":
-                return tooltip("Noise Atom: %20",
-                        "URL 编码的空格",
-                        "常用于关键字分隔、路径空白混淆、参数边界测试",
-                        "位置由上方“Noise 作用方式”决定");
-            case "%0b":
-                return tooltip("Noise Atom: %0b",
-                        "URL 编码的 vertical tab",
-                        "部分解析器会当空白处理，部分规则不会",
-                        "用于空白字符识别差异测试");
-            case "%0c":
-                return tooltip("Noise Atom: %0c",
-                        "URL 编码的 form feed",
-                        "部分解析器会当空白处理，部分规则不会",
-                        "用于空白字符识别差异测试");
-            case "%a0":
-                return tooltip("Noise Atom: %a0",
-                        "URL 编码的 NBSP 类空白字节",
-                        "看起来像空格，但和普通 %20 不同",
-                        "用于空白归一化差异测试");
-            case "%2b":
-                return tooltip("Noise Atom: %2b",
-                        "URL 编码的加号 +",
-                        "在 form-urlencoded 中可能被解释为空格",
-                        "用于 + / space 解码差异测试");
-            case "/**/":
-                return tooltip("Noise Atom: /**/",
-                        "注释型分隔符",
-                        "常用于 SQL 关键字分割、规则匹配绕过",
-                        "位置由上方“Noise 作用方式”决定");
-            default:
-                return tooltip("Noise Atom: " + atom,
-                        "通用噪音原子",
-                        "位置由上方“Noise 作用方式”决定");
+        String key = "tooltip.atom." + atom;
+        String description = I18n.t(key);
+        if (description.equals(key)) {
+            description = I18n.t("tooltip.atom.generic");
         }
+        return tooltip("Noise Atom: " + atom, description);
     }
 
     private String defaultTooltip(String text) {
@@ -1149,307 +1301,7 @@ public class ManualWafPanel extends JPanel implements IMessageEditorController {
         if (i18nTooltip != null) {
             return i18nTooltip;
         }
-        switch (text) {
-            case "Dirty(N)":
-                return tooltip("Dirty(N)",
-                        "插入 {{dirty(N)}} 占位符",
-                        "发送前展开为 N 个随机脏字符",
-                        "用于填充噪音、拉开特征、测试解析容忍度");
-            case "Null(N)":
-                return tooltip("Null(N)",
-                        "插入 {{dirtynull(N)}} 占位符",
-                        "发送前展开为 N 个随机空字节/噪音字节",
-                        "用于测试截断、二进制噪音和解析差异");
-            case "XFF 127.0.0.1":
-                return tooltip("X-Forwarded-For: 127.0.0.1",
-                        "添加或覆盖 X-Forwarded-For",
-                        "用于代理链 IP 信任、访问控制绕过测试");
-            case "X-Real-IP":
-                return tooltip("X-Real-IP: 127.0.0.1",
-                        "添加或覆盖 X-Real-IP",
-                        "Nginx/反代场景常见，用于真实客户端 IP 信任测试");
-            case "X-Client-IP":
-                return tooltip("X-Client-IP: 127.0.0.1",
-                        "添加或覆盖 X-Client-IP",
-                        "用于客户端 IP 伪造测试");
-            case "X-Remote-Addr":
-                return tooltip("X-Remote-Addr: 127.0.0.1",
-                        "添加或覆盖 X-Remote-Addr",
-                        "用于来源地址信任逻辑测试");
-            case "CF-Connecting-IP":
-                return tooltip("CF-Connecting-IP: 127.0.0.1",
-                        "添加或覆盖 CF-Connecting-IP",
-                        "Cloudflare 场景常见，用于边缘代理 IP 信任测试");
-            case "Forwarded":
-                return tooltip("Forwarded: for=127.0.0.1;proto=http;host=127.0.0.1",
-                        "添加或覆盖标准 Forwarded 头",
-                        "用于 RFC 7239 代理链解析和来源信任测试");
-            case "X-Custom-IP":
-                return tooltip("X-Custom-IP-Authorization: 127.0.0.1",
-                        "添加或覆盖 X-Custom-IP-Authorization",
-                        "用于部分框架/中间件的 IP 信任绕过测试");
-            case "Referer local":
-                return tooltip("Referer: http://127.0.0.1",
-                        "把 Referer 设置为本地地址",
-                        "用于来源校验、CSRF Referer 检查绕过测试");
-            case "X-Host local":
-                return tooltip("X-Host: 127.0.0.1",
-                        "添加或覆盖 X-Host",
-                        "用于 Host 派生信任逻辑测试");
-            case "XF Host local":
-                return tooltip("X-Forwarded-Host: 127.0.0.1",
-                        "添加或覆盖 X-Forwarded-Host",
-                        "用于反代 Host 信任、后端路由和 URL 生成差异测试");
-            case "X-Original-URL":
-                return tooltip("X-Original-URL: /",
-                        "添加或覆盖 X-Original-URL",
-                        "用于 IIS/反代/重写链路中的原始 URL 解析差异测试");
-            case "HTTP/1.0":
-                return tooltip("HTTP/1.0",
-                        "把请求行协议版本改为 HTTP/1.0",
-                        "用于代理、连接复用、Host/TE 处理差异测试");
-            case "form":
-                return tooltip("Content-Type: application/x-www-form-urlencoded",
-                        "只修改请求 Content-Type",
-                        "不改 body，用于 WAF 和后端对 body 类型理解不一致的测试");
-            case "text":
-                return tooltip("Content-Type: text/plain",
-                        "只修改请求 Content-Type",
-                        "不改 body，用于让 WAF 按纯文本处理 body 的测试");
-            case "json":
-                return tooltip("Content-Type: application/json",
-                        "只修改请求 Content-Type",
-                        "不改 body，用于 JSON parser / WAF 类型识别差异测试");
-            case "xml":
-                return tooltip("Content-Type: application/xml",
-                        "只修改请求 Content-Type",
-                        "不改 body，用于 XML parser / WAF 类型识别差异测试");
-            case "To Form":
-                return tooltip("To Form",
-                        "把当前 body 的普通参数转换成 x-www-form-urlencoded",
-                        "支持 form、multipart 文本字段、简单 JSON 对象",
-                        "会重写 body、Content-Type 和 Content-Length");
-            case "To Multipart":
-                return tooltip("To Multipart",
-                        "把当前 body 的普通参数转换成 multipart/form-data",
-                        "支持 form、multipart 文本字段、简单 JSON 对象",
-                        "跳过文件字段，会重写 body、boundary 和 Content-Length");
-            case "To JSON":
-                return tooltip("To JSON",
-                        "把当前 body 的普通参数转换成 JSON 对象",
-                        "支持 form、multipart 文本字段、简单 JSON 对象",
-                        "会重写 body、Content-Type 和 Content-Length");
-            case "Gzip body":
-                return tooltip("Gzip body",
-                        "压缩请求 body 并设置 Content-Encoding: gzip",
-                        "用于 WAF 不解压、后端解压的差异测试");
-            case "URL Encode":
-                return tooltip("URL Encode",
-                        "对选中文本做常规 URL 编码",
-                        "空格会变成 +",
-                        "字母数字属于安全字符，可能保持原样",
-                        "若无变化，会询问是否强制编码安全字符",
-                        "适合参数值；路径建议用 Path Encode");
-            case "Path Encode":
-                return tooltip("Path Encode",
-                        "对选中文本做路径编码",
-                        "保留 / 和常见安全字符，空格变 %20",
-                        "适合 request path 或 path 片段");
-            case "Double URL":
-                return tooltip("Double URL Encode",
-                        "对选中文本做双重 URL 编码",
-                        "若无变化，会询问是否强制编码安全字符",
-                        "用于二次解码链路、WAF/后端解码次数差异测试");
-            case "Mixed Encode":
-                return tooltip("Mixed Encode",
-                        "对选区里的字母数字交错做百分号编码",
-                        "保留 / ? = & 等结构字符",
-                        "例如 select -> s%65l%65c%74");
-            case "Unicode 转义":
-                return tooltip("Unicode 转义",
-                        "把选中文本转成 \\uXXXX 字符串转义",
-                        "这不是 URL 编码，不会生成 %XX",
-                        "用于 JSON/JavaScript/Java 字符串解析差异测试");
-            case "Base64 Encode":
-                return tooltip("Base64 Encode",
-                        "对选中文本做 Base64 编码",
-                        "用于编码型参数或传输层混淆");
-            case "UTF-16":
-            case "UTF-16BE":
-            case "UTF-16LE":
-            case "UTF-32":
-            case "UTF-32BE":
-            case "UTF-32LE":
-            case "IBM037":
-            case "cp290":
-                return tooltip(text,
-                        "把请求 body 按 " + text + " 重新编码",
-                        "同时更新 Content-Type charset 和 Content-Length",
-                        "用于 WAF 不识别该字符集、后端能解析的场景");
-            case "charset first":
-                return tooltip("charset first",
-                        "重排 Content-Type 参数，把 charset 放在最前",
-                        "例如 multipart/form-data; charset=IBM037; boundary=xxx",
-                        "只改 header，不重编码 body");
-            case "charset last":
-                return tooltip("charset last",
-                        "重排 Content-Type 参数，把 charset 放在最后",
-                        "例如 multipart/form-data; boundary=xxx; charset=IBM037",
-                        "只改 header，不重编码 body");
-            case "Fullwidth":
-                return tooltip("Fullwidth",
-                        "把选区里的 ASCII 可见字符转成全角字符",
-                        "例如 admin?id=1 -> ａｄｍｉｎ？ｉｄ＝１",
-                        "用于 WAF 未归一化全角字符的场景");
-            case "Homoglyph":
-                return tooltip("Homoglyph",
-                        "把选区里的部分拉丁字母换成视觉相似的 Unicode 字符",
-                        "例如 admin -> аdmіn",
-                        "用于规则按 ASCII 匹配、展示上仍相似的场景");
-            case "Zero Width":
-                return tooltip("Zero Width",
-                        "在选区每两个字符之间插入 U+200B 零宽空格",
-                        "例如 admin -> a\u200Bd\u200Bm\u200Bi\u200Bn",
-                        "用于关键词匹配和展示解析差异测试");
-            case "Upper":
-                return tooltip("Upper",
-                        "把选区转成大写",
-                        "用于大小写敏感规则差异测试");
-            case "Lower":
-                return tooltip("Lower",
-                        "把选区转成小写",
-                        "用于大小写敏感规则差异测试");
-            case "Random":
-                return tooltip("Random Case",
-                        "随机改变选区中字母大小写",
-                        "用于关键字大小写混淆");
-            case "Minimal":
-                return tooltip("Minimal — 只编码协议分隔符",
-                        "目标字符: . / \\ % @ : ; ? & = ' \" < > CR LF",
-                        "字母和数字保持原样，最小变形，先试这个",
-                        "操作: 先选中原始 ASCII/UTF-8 payload");
-            case "Full":
-                return tooltip("Full — 编码全部 ASCII",
-                        "选区内所有 ASCII 字符都转成 Ghost Unicode",
-                        "Ghost 还原后仍等于原文，隐蔽性最强但更容易破坏解析链",
-                        "操作: 先选中原始 ASCII/UTF-8 payload");
-            case "Letters":
-                return tooltip("Letters — 只编码字母",
-                        "只 Ghost 化 a-z A-Z，数字和符号保持原样",
-                        "适合绕关键字检测: class / select / union / Runtime",
-                        "操作: 先选中原始 ASCII/UTF-8 payload");
-            case "Digits":
-                return tooltip("Digits — 只编码数字",
-                        "只 Ghost 化 0-9，字母和符号保持原样",
-                        "适合版本号、参数值、\\uXXXX 数字段测试",
-                        "操作: 先选中原始 ASCII/UTF-8 payload");
-            case "Symbols":
-                return tooltip("Symbols — 只编码符号",
-                        "只 Ghost 化非字母非数字的 ASCII 符号",
-                        "包含空格、引号、斜杠、百分号、CR/LF 等",
-                        "操作: 先选中原始 ASCII/UTF-8 payload");
-            case "Shuffle":
-                return tooltip("Shuffle — 换一组 Ghost 字符",
-                        "先按低位还原结果重新随机选 Ghost Unicode",
-                        "同一 payload 换不同变体，多试几次碰运气",
-                        "操作: 先选中已 Ghost 化或待 Ghost 化文本");
-            case "Preview":
-                return tooltip("Preview — 查看 Ghost 还原结果",
-                        "逐字符展示: U+XXXX -> low byte -> ASCII",
-                        "操作: 先选中 Ghost 化后的文本");
-            case "Candidates":
-                return tooltip("Candidates — 查看候选字符",
-                        "选中一个 ASCII 字符，列出所有可用的 Ghost Unicode 替代品",
-                        "批量变形请用上方 Ghost Encode 行按钮");
-            case "8-bit":
-                return tooltip("8-bit — ch & 0xFF (默认)",
-                        "大多数场景: (byte)ch / baos.write(ch) / writeBytes",
-                        "Ghost 还原时取 char 的低 8 位");
-            case "7-bit":
-                return tooltip("7-bit — ch & 0x7F (Tomcat)",
-                        "少数场景: Tomcat RFC2231 filename* 的 hex 解析",
-                        "Ghost 还原时取 char 的低 7 位");
-            case ".%u002e":
-                return tooltip(".%u002e",
-                        "替换选区为 阮严灵丰丰甲来",
-                        "低 8 位还原后为 .%u002e，后续解码可变成 ..",
-                        "放在 request path 时推荐 Raw Socket 发送",
-                        "操作: 先选中要替换的位置");
-            case "CRLF":
-                return tooltip("CRLF",
-                        "替换选区为 瘍瘊",
-                        "低 8 位还原后为 \\r\\n",
-                        "用于 Header/SMTP/文本协议边界测试",
-                        "放在 header value 时推荐 Raw Socket 发送",
-                        "操作: 先选中 header value 或协议字段中的替换位置");
-            case ".jsp":
-                return tooltip(".jsp",
-                        "替换选区为 .陪sp",
-                        "陪 的低 8 位是 j，8-bit 还原后为 .jsp",
-                        "这是裸字符 Ghost，和 Tomcat %HH 的 URL hex Ghost 不同",
-                        "操作: 先选中原扩展名或 filename 中要替换的位置");
-            case "@type":
-                return tooltip("@type",
-                        "把 @type 转成低位等价 Unicode",
-                        "用于 fastjson/Jackson key 相关绕过构造",
-                        "操作: 先选中 JSON key 或待替换位置");
-            case "%2>":
-                return tooltip("%2>",
-                        "Jetty 非严格 hex 解析案例",
-                        "> 经 convertHexDigit 计算可变成 E，%2> 等价 %2E",
-                        "这是 parser differential，不是标准 char & 0xFF",
-                        "操作: 选中 .、%2e，或包含这些 token 的路径片段");
-            case "class":
-                return tooltip("class",
-                        "把 class 转成低位等价 Unicode",
-                        "用于 Spring/Java Bean path 关键字绕过构造",
-                        "操作: 先选中 class 或待替换位置");
-            case "Spring Path":
-                return tooltip("Spring Path",
-                        "替换 request path 为 Spring/Jetty 风格探测路径",
-                        "包含 阮严灵丰丰甲来 -> .%u002e 与 %64 URL trigger",
-                        "推荐发送: Raw Socket");
-            case "Tomcat filename*":
-                return tooltip("Tomcat filename*",
-                        "尝试替换 multipart filename/filename* 为 1.陪sp",
-                        "低位还原后可能变成 1.jsp",
-                        "SpringBoot ContentDisposition 有额外校验，不保证通用");
-            case "fastjson \\x4_":
-                return tooltip("fastjson \\x4_",
-                        "替换选区为 \\x4Jtype",
-                        "fastjson 宽松 \\x 表中非 hex 字符可按 0 参与计算",
-                        "\\x4J 可解析为 @",
-                        "操作: 先选中 @type 或 JSON key 内容");
-            case "fastjson \\u":
-                return tooltip("fastjson \\u",
-                        "把选区转成 \\uXXXX，并把数字位替换为 Unicode 数字",
-                        "例如 @type -> \\u٠٠٤٠\\u٠٠٧٤...",
-                        "这是 Unicode digit 绕过，不是标准 low-byte fold",
-                        "操作: 先选中 @type 或 JSON key 内容");
-            case "jackson \\u":
-                return tooltip("jackson \\u",
-                        "把选区转成 \\uXXXX，并把 4 个 hex 位换成 Ghost 字符",
-                        "低位还原后仍是标准 \\uXXXX，给 Jackson charToHex(ch & 0xFF) 场景用",
-                        "只适合 ReaderBasedJsonParser / char[] 输入链",
-                        "SpringBoot 默认 UTF8StreamJsonParser 通常不触发",
-                        "操作: 先选中要转成 \\u Ghost escape 的 ASCII 文本");
-            case "Tomcat %HH":
-                return tooltip("Tomcat %HH",
-                        "把选区每个字符改成 %HH，但 H 用 7-bit Ghost 字符表示",
-                        "还原模式等价 ch & 0x7F，适合 Tomcat RFC2231 filename* hex 解析",
-                        "例如选中 j 可生成 %鸶繡 这类变体，后端可能解析为 j",
-                        "操作: 先选中 filename* 中要隐藏的原始字符，不要选 6a");
-            case "Header CRLF":
-                return tooltip("Header CRLF",
-                        "替换选区为 瘍瘊",
-                        "低位还原后为 \\r\\n，可用于 header value 断行测试",
-                        "推荐发送: Raw Socket",
-                        "操作: 先选中 header value 中要替换的位置");
-            default:
-                return tooltip(text,
-                        "点击后对当前请求执行该变换",
-                        "有选区的功能通常优先处理选区，没选区则按该按钮的默认范围处理");
-        }
+        return tooltip(resolveBtnText(text), I18n.t("tooltip.default.desc"));
     }
 
     private static class MultiLineToolTip extends JToolTip {
@@ -1502,7 +1354,11 @@ public class ManualWafPanel extends JPanel implements IMessageEditorController {
     }
 
     private JLabel createInspectorLine(String text) {
-        JLabel label = new JLabel(text);
+        JLabel label = new JLabel(text) {
+            @Override
+            public String getToolTipText() { return getText(); }
+        };
+        label.setToolTipText(text);
         label.setFont(new Font(Font.SANS_SERIF, Font.PLAIN, 11));
         label.setAlignmentX(Component.LEFT_ALIGNMENT);
         return label;
@@ -1523,12 +1379,23 @@ public class ManualWafPanel extends JPanel implements IMessageEditorController {
         byte[] safeSel = sel == null ? new byte[0] : sel;
         boolean sameReq = Arrays.equals(safeReq, lastInspectorBytes);
         boolean sameSelection = Arrays.equals(safeSel, lastInspectorSelectionBytes);
-        if (sameReq && sameSelection)
-            return;
+        for (JButton button : selectionButtons) updateSelectionButton(button, safeSel.length > 0);
+        if (scopeLabel != null) scopeLabel.setText(safeSel.length > 0
+                ? I18n.t("manual.scope.selection", safeSel.length) : I18n.t("manual.scope.none"));
+        if (activeSend != null) {
+            statusLabel.setText(I18n.t("manual.sending.elapsed", (System.nanoTime() - activeSend.startNs) / 1000000000L));
+        }
+        reconcileTransformations(safeReq);
+        updateTransformationLabel();
+        replayOriginalBtn.setEnabled(activeSend == null && originalRequest.length > 0);
+        restoreOriginalBtn.setEnabled(originalRequest.length > 0 && !Arrays.equals(safeReq, originalRequest));
+        if (sameReq && sameSelection) return;
 
         if (!sameReq) {
             lastInspectorBytes = Arrays.copyOf(safeReq, safeReq.length);
             updateRequestInspector(lastInspectorBytes);
+            updateRedirectAvailability();
+            if (activeSend == null) showSelectedResponse();
         }
         if (!sameSelection) {
             lastInspectorSelectionBytes = Arrays.copyOf(safeSel, safeSel.length);
@@ -1574,7 +1441,7 @@ public class ManualWafPanel extends JPanel implements IMessageEditorController {
         String text = new String(req, StandardCharsets.UTF_8);
         String hints = buildParserIntent(text);
         inspectorHintsLabel
-                .setText("Payload hints: " + ("自定义 payload".equals(hints) ? "-" : truncateForInspector(hints, 110)));
+                .setText(I18n.t("inspector.payload_hints") + ": " + (I18n.t("inspector.custom_payload").equals(hints) ? "-" : truncateForInspector(hints, 110)));
 
         inspectorDiffLabel.setText("Diff: " + buildRequestDiffSummary(req));
     }
@@ -1587,6 +1454,11 @@ public class ManualWafPanel extends JPanel implements IMessageEditorController {
         if (ghostSelectionFoldLabel == null) {
             return;
         }
+        if (parserPreviewPayload != null && !findAllOccurrences(getRequestBytes(), parserPreviewBytes).isEmpty()) {
+            showParserPreview(parserPreviewName, parserPreviewPayload, parserPreviewBytes);
+            return;
+        }
+        parserPreviewPayload = null;
         if (selectedBytes == null || selectedBytes.length == 0) {
             ghostSelectionFoldLabel.setText(I18n.t("ghost.selection_fold") + " " + foldModeTag()
                     + ": " + I18n.t("ghost.risk.select"));
@@ -1609,6 +1481,7 @@ public class ManualWafPanel extends JPanel implements IMessageEditorController {
     }
 
     private void updateGhostSelectionFoldPreview(String selected, String folded, boolean rawRecommended) {
+        parserPreviewPayload = null;
         if (ghostSelectionFoldLabel == null || ghostPreviewRiskLabel == null) {
             return;
         }
@@ -1706,7 +1579,7 @@ public class ManualWafPanel extends JPanel implements IMessageEditorController {
         return unique;
     }
 
-    private String firstLine(byte[] req) {
+    private static String firstLine(byte[] req) {
         int end = -1;
         for (int i = 0; i < req.length; i++) {
             if (req[i] == '\n') {
@@ -1749,30 +1622,29 @@ public class ManualWafPanel extends JPanel implements IMessageEditorController {
     }
 
     private String buildRequestDiffSummary(byte[] req) {
-        if (originalRequest == null || originalRequest.length == 0)
-            return "original unavailable";
-        if (Arrays.equals(originalRequest, req))
-            return "unchanged";
+        return requestDiffSummary(originalRequest, req);
+    }
 
+    static String requestDiffSummary(byte[] originalRequest, byte[] req) {
+        if (originalRequest == null || originalRequest.length == 0) return I18n.t("diff.no_original");
+        if (Arrays.equals(originalRequest, req)) return I18n.t("diff.unchanged");
         List<String> parts = new ArrayList<>();
-        String oldLine = firstLine(originalRequest);
-        String newLine = firstLine(req);
-        if (!oldLine.equals(newLine))
-            parts.add("request line changed");
-
-        int oldBody = bodyLength(originalRequest);
-        int newBody = bodyLength(req);
-        if (oldBody != newBody)
-            parts.add("body " + oldBody + " -> " + newBody);
-
-        if (parts.isEmpty())
-            parts.add("headers changed");
+        if (!firstLine(originalRequest).equals(firstLine(req))) parts.add(I18n.t("diff.line"));
+        int oldEnd = findHeaderEnd(originalRequest), newEnd = findHeaderEnd(req);
+        oldEnd = oldEnd < 0 ? originalRequest.length : oldEnd;
+        newEnd = newEnd < 0 ? req.length : newEnd;
+        int oldLineEnd = firstLineEnd(originalRequest), newLineEnd = firstLineEnd(req);
+        if (!Arrays.equals(Arrays.copyOfRange(originalRequest, oldLineEnd, oldEnd),
+                Arrays.copyOfRange(req, newLineEnd, newEnd))) parts.add(I18n.t("diff.headers"));
+        if (!Arrays.equals(Arrays.copyOfRange(originalRequest, oldEnd, originalRequest.length),
+                Arrays.copyOfRange(req, newEnd, req.length)))
+            parts.add(I18n.t("diff.body", originalRequest.length - oldEnd, req.length - newEnd));
         return String.join(", ", parts);
     }
 
-    private int bodyLength(byte[] req) {
-        int headerEnd = findHeaderEnd(req);
-        return headerEnd > 0 ? Math.max(0, req.length - headerEnd) : 0;
+    private static int firstLineEnd(byte[] bytes) {
+        for (int i = 0; i < bytes.length; i++) if (bytes[i] == '\n') return i + 1;
+        return bytes.length;
     }
 
     private String truncateForInspector(String value, int max) {
@@ -1785,7 +1657,7 @@ public class ManualWafPanel extends JPanel implements IMessageEditorController {
 
     private String buildParserIntent(String payload) {
         if (payload == null || payload.isEmpty()) {
-            return "空 payload";
+            return I18n.t("inspector.empty_payload");
         }
         List<String> hints = new ArrayList<>();
         if (payload.contains("阮严灵丰丰甲来"))
@@ -1806,18 +1678,36 @@ public class ManualWafPanel extends JPanel implements IMessageEditorController {
                 hints.add("low-byte => " + escape(folded));
             }
         }
-        return hints.isEmpty() ? "自定义 payload" : String.join("；", hints);
+        return hints.isEmpty() ? I18n.t("inspector.custom_payload") : String.join("; ", hints);
     }
 
     private JPanel createHistoryPanel() {
         JPanel panel = new JPanel(new BorderLayout());
-        panel.setBorder(BorderFactory.createTitledBorder("History"));
+        panel.setBorder(BorderFactory.createEtchedBorder());
+        panel.setMinimumSize(new Dimension(240, 0));
+        JPanel heading = new JPanel(new BorderLayout(10, 0));
+        heading.setBorder(new EmptyBorder(4, 6, 4, 6));
+        heading.add(new JLabel("History"), BorderLayout.WEST);
+        JLabel hint = new JLabel(I18n.t("manual.history.short_hint"));
+        hint.setHorizontalAlignment(SwingConstants.RIGHT);
+        hint.setToolTipText(I18n.t("manual.history.hint"));
+        heading.add(hint, BorderLayout.CENTER);
+        panel.add(heading, BorderLayout.NORTH);
 
         historyModel = new HistoryTableModel();
         historyTable = new JTable(historyModel);
         historyTable.setAutoCreateRowSorter(true);
+        historyTable.setAutoResizeMode(JTable.AUTO_RESIZE_OFF);
+        int[] widths = {36, 65, 60, 180, 55, 80, 90, 80, 200};
+        for (int i = 0; i < widths.length; i++) {
+            historyTable.getColumnModel().getColumn(i).setPreferredWidth(widths[i]);
+        }
+        // 状态、方法和路径优先可见；通道、耗时及网络目标可横向查看。
+        historyTable.moveColumn(4, 1);
+        historyTable.moveColumn(2, 6);
+        historyTable.getTableHeader().setToolTipText(I18n.t("manual.history.hint"));
 
-        // 单击：显示响应
+        // 单击：选中历史记录并显示摘要
         historyTable.getSelectionModel().addListSelectionListener(e -> {
             if (!e.getValueIsAdjusting()) {
                 int row = historyTable.getSelectedRow();
@@ -1866,11 +1756,11 @@ public class ManualWafPanel extends JPanel implements IMessageEditorController {
         int modelRow = historyTable.convertRowIndexToModel(row);
 
         JPopupMenu popup = new JPopupMenu();
-        JMenuItem loadItem = new JMenuItem("加载请求到编辑器");
+        JMenuItem loadItem = new JMenuItem(I18n.t("manual.history.load"));
         loadItem.addActionListener(e -> loadHistoryRequest(modelRow));
         popup.add(loadItem);
 
-        JMenuItem deleteItem = new JMenuItem("删除此记录");
+        JMenuItem deleteItem = new JMenuItem(I18n.t("manual.history.delete"));
         deleteItem.addActionListener(e -> {
             if (modelRow >= 0 && modelRow < historyEntries.size()) {
                 historyEntries.remove(modelRow);
@@ -1883,15 +1773,32 @@ public class ManualWafPanel extends JPanel implements IMessageEditorController {
     }
 
     private void loadHistoryRequest(int index) {
-        if (index < 0 || index >= historyEntries.size())
-            return;
+        if (index < 0 || index >= historyEntries.size()) return;
         HistoryEntry entry = historyEntries.get(index);
-        if (entry.requestBytes != null && entry.requestBytes.length > 0) {
-            runRequestMutation(() -> setRequestBytes(entry.requestBytes));
-            if (statusLabel != null) {
-                statusLabel.setText(I18n.t("status.history_loaded", entry.id));
-            }
+        IHttpService service = entry.service != null ? entry.service
+                : entry.requestResponse == null ? null : entry.requestResponse.getHttpService();
+        if (service == null) {
+            statusLabel.setText(I18n.t("manual.history.no_target"));
+            return;
         }
+        if (!confirmReplaceRequest(entry.requestBytes)) return;
+        loadRequest(new BypassMain.SimpleHttpRequestResponse(service, entry.requestBytes, entry.responseBytes));
+        setSenderMode("Raw".equals(entry.sender) ? SenderMode.RAW : SenderMode.BURP);
+        statusLabel.setText(I18n.t("status.history_loaded", entry.id));
+    }
+
+    private boolean confirmReplaceRequest(byte[] incoming) {
+        byte[] current = getRequestBytes();
+        if (current.length == 0 || Arrays.equals(current, incoming) || Arrays.equals(current, originalRequest)
+                || Arrays.equals(current, lastSubmittedRequest)) return true;
+        return JOptionPane.showConfirmDialog(this, I18n.t("manual.replace.confirm"),
+                I18n.t("dialog.tip.title"), JOptionPane.YES_NO_OPTION) == JOptionPane.YES_OPTION;
+    }
+
+    public boolean acceptRequest(IHttpRequestResponse message) {
+        if (message == null || !confirmReplaceRequest(message.getRequest())) return false;
+        loadRequest(message);
+        return true;
     }
 
     private void replaceInSelectionOrPath(java.util.function.Function<String, String> transformer) {
@@ -1902,7 +1809,7 @@ public class ManualWafPanel extends JPanel implements IMessageEditorController {
         }
         String path = getRequestPath();
         if (path != null && transformer.apply(path).equals(path)) {
-            JOptionPane.showMessageDialog(this, "当前 path 没有可变换的内容，请先选中目标片段",
+            JOptionPane.showMessageDialog(this, I18n.t("dialog.path_no_target"),
                     I18n.t("dialog.tip.title"), JOptionPane.INFORMATION_MESSAGE);
             return;
         }
@@ -1964,7 +1871,7 @@ public class ManualWafPanel extends JPanel implements IMessageEditorController {
     private void mutateRequestPath(java.util.function.Function<String, String> transformer) {
         byte[] req = getRequestBytes();
         if (req == null || req.length == 0) {
-            JOptionPane.showMessageDialog(this, "请求为空", I18n.t("dialog.tip.title"), JOptionPane.INFORMATION_MESSAGE);
+            JOptionPane.showMessageDialog(this, I18n.t("dialog.request_empty"), I18n.t("dialog.tip.title"), JOptionPane.INFORMATION_MESSAGE);
             return;
         }
 
@@ -1976,7 +1883,7 @@ public class ManualWafPanel extends JPanel implements IMessageEditorController {
             }
         }
         if (lineEnd <= 0) {
-            JOptionPane.showMessageDialog(this, "未识别请求行", I18n.t("dialog.tip.title"), JOptionPane.INFORMATION_MESSAGE);
+            JOptionPane.showMessageDialog(this, I18n.t("dialog.request_line_missing"), I18n.t("dialog.tip.title"), JOptionPane.INFORMATION_MESSAGE);
             return;
         }
         int realLineEnd = lineEnd;
@@ -1996,7 +1903,7 @@ public class ManualWafPanel extends JPanel implements IMessageEditorController {
             }
         }
         if (firstSpace < 0 || secondSpace < 0) {
-            JOptionPane.showMessageDialog(this, "请求行格式不规范，无法定位 path", "提示",
+            JOptionPane.showMessageDialog(this, I18n.t("dialog.path_not_found"), I18n.t("dialog.tip.title"),
                     JOptionPane.INFORMATION_MESSAGE);
             return;
         }
@@ -2055,7 +1962,7 @@ public class ManualWafPanel extends JPanel implements IMessageEditorController {
     private void upsertRequestHeader(String name, String value) {
         byte[] request = getRequestBytes();
         if (request == null || request.length == 0) {
-            JOptionPane.showMessageDialog(this, "请求为空", I18n.t("dialog.tip.title"), JOptionPane.INFORMATION_MESSAGE);
+            JOptionPane.showMessageDialog(this, I18n.t("dialog.request_empty"), I18n.t("dialog.tip.title"), JOptionPane.INFORMATION_MESSAGE);
             return;
         }
         IRequestInfo info = Utils.helpers.analyzeRequest(request);
@@ -2068,7 +1975,7 @@ public class ManualWafPanel extends JPanel implements IMessageEditorController {
     private void setRequestContentType(String value) {
         byte[] request = getRequestBytes();
         if (request == null || request.length == 0) {
-            JOptionPane.showMessageDialog(this, "请求为空", I18n.t("dialog.tip.title"), JOptionPane.INFORMATION_MESSAGE);
+            JOptionPane.showMessageDialog(this, I18n.t("dialog.request_empty"), I18n.t("dialog.tip.title"), JOptionPane.INFORMATION_MESSAGE);
             return;
         }
         IRequestInfo info = Utils.helpers.analyzeRequest(request);
@@ -2081,28 +1988,28 @@ public class ManualWafPanel extends JPanel implements IMessageEditorController {
     private void moveCharsetParam(boolean first) {
         byte[] request = getRequestBytes();
         if (request == null || request.length == 0) {
-            JOptionPane.showMessageDialog(this, "请求为空", I18n.t("dialog.tip.title"), JOptionPane.INFORMATION_MESSAGE);
+            JOptionPane.showMessageDialog(this, I18n.t("dialog.request_empty"), I18n.t("dialog.tip.title"), JOptionPane.INFORMATION_MESSAGE);
             return;
         }
         IRequestInfo info = Utils.helpers.analyzeRequest(request);
         List<String> headers = new ArrayList<>(info.getHeaders());
         int idx = findHeaderIndex(headers, "Content-Type");
         if (idx < 0) {
-            JOptionPane.showMessageDialog(this, "当前请求没有 Content-Type", "提示",
+            JOptionPane.showMessageDialog(this, I18n.t("dialog.content_type_missing"), I18n.t("dialog.tip.title"),
                     JOptionPane.INFORMATION_MESSAGE);
             return;
         }
         String line = headers.get(idx);
         int colon = line.indexOf(':');
         if (colon < 0) {
-            JOptionPane.showMessageDialog(this, "Content-Type 格式异常", "提示",
+            JOptionPane.showMessageDialog(this, I18n.t("dialog.content_type_invalid"), I18n.t("dialog.tip.title"),
                     JOptionPane.INFORMATION_MESSAGE);
             return;
         }
         String value = line.substring(colon + 1).trim();
         String reordered = reorderCharsetParam(value, first);
         if (reordered == null) {
-            JOptionPane.showMessageDialog(this, "当前 Content-Type 没有 charset 参数，请先做字符集编码",
+            JOptionPane.showMessageDialog(this, I18n.t("dialog.charset_missing"),
                     I18n.t("dialog.tip.title"), JOptionPane.INFORMATION_MESSAGE);
             return;
         }
@@ -2154,36 +2061,32 @@ public class ManualWafPanel extends JPanel implements IMessageEditorController {
         transformSelectionWithNoChangeOption(
                 s -> {
                     try {
-                        return URLEncoder.encode(s, "UTF-8");
+                        return URLEncoder.encode(s, "ISO-8859-1");
                     } catch (UnsupportedEncodingException e) {
                         return s;
                     }
                 },
-                "当前选区按标准 URL 编码后没有变化。\n\n"
-                        + "这通常是因为选区只包含字母、数字等 URL 安全字符。\n"
-                        + "是否仍然强制把每个 UTF-8 字节编码成 %XX？",
-                this::percentEncodeAllUtf8Bytes);
+                I18n.t("dialog.force_url_encode"),
+                this::percentEncodeAllBytes);
     }
 
     private void pathUrlEncode() {
         transformSelectionWithNoChangeOption(
                 this::encodePathValue,
-                "当前选区按 Path 编码后没有变化。\n\n"
-                        + "这通常是因为选区只包含路径安全字符。\n"
-                        + "是否仍然强制把每个 UTF-8 字节编码成 %XX？",
-                this::percentEncodeAllUtf8Bytes);
+                I18n.t("dialog.force_path_encode"),
+                this::percentEncodeAllBytes);
     }
 
-    private String percentEncodeAllUtf8Bytes(String s) {
+    private String percentEncodeAllBytes(String s) {
         StringBuilder sb = new StringBuilder();
-        for (byte b : s.getBytes(StandardCharsets.UTF_8)) {
+        for (byte b : s.getBytes(StandardCharsets.ISO_8859_1)) {
             sb.append(String.format("%%%02X", b & 0xFF));
         }
         return sb.toString();
     }
 
     private String encodePathValue(String s) {
-        byte[] bytes = s.getBytes(StandardCharsets.UTF_8);
+        byte[] bytes = s.getBytes(StandardCharsets.ISO_8859_1);
         StringBuilder sb = new StringBuilder();
         for (byte raw : bytes) {
             int b = raw & 0xFF;
@@ -2205,17 +2108,15 @@ public class ManualWafPanel extends JPanel implements IMessageEditorController {
         transformSelectionWithNoChangeOption(
                 s -> {
                     try {
-                        return URLEncoder.encode(URLEncoder.encode(s, "UTF-8"), "UTF-8");
+                        return URLEncoder.encode(URLEncoder.encode(s, "ISO-8859-1"), "ISO-8859-1");
                     } catch (UnsupportedEncodingException e) {
                         return s;
                     }
                 },
-                "当前选区按双重 URL 编码后没有变化。\n\n"
-                        + "这通常是因为选区只包含字母、数字等 URL 安全字符。\n"
-                        + "是否仍然强制编码安全字符？例如 d -> %64 -> %2564。",
+                I18n.t("dialog.force_double_encode"),
                 s -> {
                     try {
-                        return URLEncoder.encode(percentEncodeAllUtf8Bytes(s), "UTF-8");
+                        return URLEncoder.encode(percentEncodeAllBytes(s), "UTF-8");
                     } catch (UnsupportedEncodingException e) {
                         return s;
                     }
@@ -2252,11 +2153,12 @@ public class ManualWafPanel extends JPanel implements IMessageEditorController {
     }
 
     private void base64Encode() {
-        transformSelection(s -> Base64.getEncoder().encodeToString(s.getBytes(StandardCharsets.UTF_8)));
+        byte[] selected = getSelectedRequestBytes();
+        if (selected.length > 0) replaceOccurrenceInRequest(selected, Base64.getEncoder().encode(selected));
     }
 
     private void toUnicodeEscape() {
-        transformSelection(s -> {
+        transformTextSelection(s -> {
             StringBuilder sb = new StringBuilder();
             for (char c : s.toCharArray()) {
                 sb.append(String.format("\\u%04x", (int) c));
@@ -2266,37 +2168,37 @@ public class ManualWafPanel extends JPanel implements IMessageEditorController {
     }
 
     private void insertDirtyData() {
-        String input = JOptionPane.showInputDialog(this, "输入脏数据长度（数字字符数量）:", "Dirty Data",
+        String input = JOptionPane.showInputDialog(this, I18n.t("dialog.dirty_length"), "Dirty Data",
                 JOptionPane.QUESTION_MESSAGE);
         if (input == null || input.trim().isEmpty())
             return;
         try {
             int count = Integer.parseInt(input.trim());
             if (count <= 0) {
-                JOptionPane.showMessageDialog(this, "请输入大于 0 的数字", I18n.t("dialog.error.title"),
+                JOptionPane.showMessageDialog(this, I18n.t("dialog.positive_number"), I18n.t("dialog.error.title"),
                         JOptionPane.ERROR_MESSAGE);
                 return;
             }
             insertAtCaretOrFallback(("{{dirty(" + count + ")}}").getBytes(StandardCharsets.ISO_8859_1));
         } catch (NumberFormatException e) {
-            JOptionPane.showMessageDialog(this, "请输入有效数字", I18n.t("dialog.error.title"), JOptionPane.ERROR_MESSAGE);
+            JOptionPane.showMessageDialog(this, I18n.t("dialog.valid_number"), I18n.t("dialog.error.title"), JOptionPane.ERROR_MESSAGE);
         }
     }
 
     private void insertNullBytes() {
-        String input = JOptionPane.showInputDialog(this, "输入 Null 字节数量:", "Null Bytes", JOptionPane.QUESTION_MESSAGE);
+        String input = JOptionPane.showInputDialog(this, I18n.t("dialog.null_count"), "Null Bytes", JOptionPane.QUESTION_MESSAGE);
         if (input == null || input.trim().isEmpty())
             return;
         try {
             int count = Integer.parseInt(input.trim());
             if (count <= 0) {
-                JOptionPane.showMessageDialog(this, "请输入大于 0 的数字", I18n.t("dialog.error.title"),
+                JOptionPane.showMessageDialog(this, I18n.t("dialog.positive_number"), I18n.t("dialog.error.title"),
                         JOptionPane.ERROR_MESSAGE);
                 return;
             }
             insertAtCaretOrFallback(("{{dirtynull(" + count + ")}}").getBytes(StandardCharsets.ISO_8859_1));
         } catch (NumberFormatException e) {
-            JOptionPane.showMessageDialog(this, "请输入有效数字", I18n.t("dialog.error.title"), JOptionPane.ERROR_MESSAGE);
+            JOptionPane.showMessageDialog(this, I18n.t("dialog.valid_number"), I18n.t("dialog.error.title"), JOptionPane.ERROR_MESSAGE);
         }
     }
 
@@ -2364,33 +2266,6 @@ public class ManualWafPanel extends JPanel implements IMessageEditorController {
         return sb.toString();
     }
 
-    private boolean hasHeaderContains(String headers, String headerName, String needle) {
-        if (headers == null)
-            return false;
-        String[] lines = headers.split("\\r?\\n", -1);
-        for (String line : lines) {
-            if (line.toLowerCase().startsWith(headerName.toLowerCase() + ":")) {
-                return line.toLowerCase().contains(needle.toLowerCase());
-            }
-        }
-        return false;
-    }
-
-    private boolean looksBinaryBody(String body) {
-        if (body == null || body.isEmpty())
-            return false;
-        int sampleLen = Math.min(body.length(), 4096);
-        int suspicious = 0;
-        for (int i = 0; i < sampleLen; i++) {
-            char c = body.charAt(i);
-            if (c == '\r' || c == '\n' || c == '\t')
-                continue;
-            if (c < 0x20 || (c >= 0x7F && c <= 0x9F))
-                suspicious++;
-        }
-        return suspicious > (sampleLen * 0.10);
-    }
-
     private static class BodyField {
         final String name;
         final String value;
@@ -2405,16 +2280,17 @@ public class ManualWafPanel extends JPanel implements IMessageEditorController {
         try {
             byte[] request = getRequestBytes();
             if (request == null || request.length == 0) {
-                JOptionPane.showMessageDialog(this, "请求内容为空", I18n.t("dialog.tip.title"), JOptionPane.WARNING_MESSAGE);
+                JOptionPane.showMessageDialog(this, I18n.t("dialog.request_content_empty"), I18n.t("dialog.tip.title"), JOptionPane.WARNING_MESSAGE);
                 return;
             }
 
+            if (!canTransformBody(request)) return;
             IRequestInfo info = Utils.helpers.analyzeRequest(request);
             List<String> headers = new ArrayList<>(info.getHeaders());
             byte[] body = Arrays.copyOfRange(request, info.getBodyOffset(), request.length);
 
             if (body.length == 0) {
-                JOptionPane.showMessageDialog(this, "请求体为空", I18n.t("dialog.tip.title"), JOptionPane.WARNING_MESSAGE);
+                JOptionPane.showMessageDialog(this, I18n.t("dialog.body_empty"), I18n.t("dialog.tip.title"), JOptionPane.WARNING_MESSAGE);
                 return;
             }
 
@@ -2422,7 +2298,7 @@ public class ManualWafPanel extends JPanel implements IMessageEditorController {
             for (String h : headers) {
                 String hl = h.toLowerCase();
                 if (hl.startsWith("content-encoding:") && hl.contains("gzip")) {
-                    JOptionPane.showMessageDialog(this, "Header 显示已是 Gzip 格式，取消操作。", "提示",
+                    JOptionPane.showMessageDialog(this, I18n.t("dialog.gzip_already_header"), I18n.t("dialog.tip.title"),
                             JOptionPane.INFORMATION_MESSAGE);
                     return;
                 }
@@ -2432,8 +2308,8 @@ public class ManualWafPanel extends JPanel implements IMessageEditorController {
             if (body.length >= 2 && (body[0] & 0xFF) == 0x1F && (body[1] & 0xFF) == 0x8B) {
                 int ret = JOptionPane.showConfirmDialog(
                         this,
-                        "检测到 Body 似乎已经是 Gzip 格式 (Magic Bytes 1F 8B)。\n是否继续强制压缩？(可能导致双重压缩)",
-                        "警告",
+                        I18n.t("dialog.gzip_confirm"),
+                        I18n.t("dialog.warning.title"),
                         JOptionPane.YES_NO_OPTION);
                 if (ret != JOptionPane.YES_OPTION)
                     return;
@@ -2453,7 +2329,7 @@ public class ManualWafPanel extends JPanel implements IMessageEditorController {
             byte[] newRequest = Utils.helpers.buildHttpMessage(headers, gzipped);
             setRequestBytes(newRequest);
         } catch (Exception e) {
-            JOptionPane.showMessageDialog(this, "Gzip 错误: " + e.getMessage(), I18n.t("dialog.error.title"),
+            JOptionPane.showMessageDialog(this, I18n.t("dialog.error.gzip", e.getMessage()), I18n.t("dialog.error.title"),
                     JOptionPane.ERROR_MESSAGE);
         }
     }
@@ -2462,25 +2338,26 @@ public class ManualWafPanel extends JPanel implements IMessageEditorController {
         try {
             byte[] request = getRequestBytes();
             if (request == null || request.length == 0) {
-                JOptionPane.showMessageDialog(this, "请求内容为空", I18n.t("dialog.tip.title"), JOptionPane.WARNING_MESSAGE);
+                JOptionPane.showMessageDialog(this, I18n.t("dialog.request_content_empty"), I18n.t("dialog.tip.title"), JOptionPane.WARNING_MESSAGE);
                 return;
             }
 
+            if (!canTransformBody(request)) return;
             IRequestInfo info = Utils.helpers.analyzeRequest(request);
             List<String> headers = new ArrayList<>(info.getHeaders());
             byte[] body = Arrays.copyOfRange(request, info.getBodyOffset(), request.length);
             List<BodyField> fields = extractBodyFields(headers, body);
             if (fields.isEmpty()) {
-                JOptionPane.showMessageDialog(this, "无法从当前 body 提取可转换的普通参数", "提示",
+                JOptionPane.showMessageDialog(this, I18n.t("dialog.no_convertible_params"), I18n.t("dialog.tip.title"),
                         JOptionPane.INFORMATION_MESSAGE);
                 return;
             }
 
             Charset cs = charsetFromHeaders(headers);
             byte[] newBody = buildFormBody(fields, cs);
-            replaceBodyAndContentType(headers, newBody, "application/x-www-form-urlencoded");
+            replaceBodyAndContentType(headers, newBody, "application/x-www-form-urlencoded; charset=" + cs.name());
         } catch (Exception e) {
-            JOptionPane.showMessageDialog(this, "Form 转换错误: " + e.getMessage(), I18n.t("dialog.error.title"),
+            JOptionPane.showMessageDialog(this, I18n.t("dialog.error.form", e.getMessage()), I18n.t("dialog.error.title"),
                     JOptionPane.ERROR_MESSAGE);
         }
     }
@@ -2489,22 +2366,23 @@ public class ManualWafPanel extends JPanel implements IMessageEditorController {
         try {
             byte[] request = getRequestBytes();
             if (request == null || request.length == 0) {
-                JOptionPane.showMessageDialog(this, "请求内容为空", I18n.t("dialog.tip.title"), JOptionPane.WARNING_MESSAGE);
+                JOptionPane.showMessageDialog(this, I18n.t("dialog.request_content_empty"), I18n.t("dialog.tip.title"), JOptionPane.WARNING_MESSAGE);
                 return;
             }
 
+            if (!canTransformBody(request)) return;
             IRequestInfo info = Utils.helpers.analyzeRequest(request);
             List<String> headers = new ArrayList<>(info.getHeaders());
             byte[] body = Arrays.copyOfRange(request, info.getBodyOffset(), request.length);
 
             if (body.length == 0) {
-                JOptionPane.showMessageDialog(this, "请求体为空", I18n.t("dialog.tip.title"), JOptionPane.WARNING_MESSAGE);
+                JOptionPane.showMessageDialog(this, I18n.t("dialog.body_empty"), I18n.t("dialog.tip.title"), JOptionPane.WARNING_MESSAGE);
                 return;
             }
 
             String currentCT = contentTypeFromHeaders(headers);
             if (currentCT.toLowerCase().contains("multipart/form-data")) {
-                JOptionPane.showMessageDialog(this, "当前请求已是 Multipart 格式", I18n.t("dialog.tip.title"),
+                JOptionPane.showMessageDialog(this, I18n.t("dialog.multipart_already"), I18n.t("dialog.tip.title"),
                         JOptionPane.INFORMATION_MESSAGE);
                 return;
             }
@@ -2512,7 +2390,7 @@ public class ManualWafPanel extends JPanel implements IMessageEditorController {
             String boundary = "----BypassProBoundary" + System.currentTimeMillis();
             List<BodyField> fields = extractBodyFields(headers, body);
             if (fields.isEmpty()) {
-                JOptionPane.showMessageDialog(this, "无法从当前 body 提取可转换的普通参数", "提示",
+                JOptionPane.showMessageDialog(this, I18n.t("dialog.no_convertible_params"), I18n.t("dialog.tip.title"),
                         JOptionPane.INFORMATION_MESSAGE);
                 return;
             }
@@ -2520,7 +2398,7 @@ public class ManualWafPanel extends JPanel implements IMessageEditorController {
             byte[] multipartBody = buildMultipartBody(fields, boundary, cs);
             replaceBodyAndContentType(headers, multipartBody, "multipart/form-data; boundary=" + boundary);
         } catch (Exception e) {
-            JOptionPane.showMessageDialog(this, "Multipart 转换错误: " + e.getMessage(), I18n.t("dialog.error.title"),
+            JOptionPane.showMessageDialog(this, I18n.t("dialog.error.multipart", e.getMessage()), I18n.t("dialog.error.title"),
                     JOptionPane.ERROR_MESSAGE);
         }
     }
@@ -2529,16 +2407,18 @@ public class ManualWafPanel extends JPanel implements IMessageEditorController {
         try {
             byte[] request = getRequestBytes();
             if (request == null || request.length == 0) {
-                JOptionPane.showMessageDialog(this, "请求内容为空", I18n.t("dialog.tip.title"), JOptionPane.WARNING_MESSAGE);
+                JOptionPane.showMessageDialog(this, I18n.t("dialog.request_content_empty"), I18n.t("dialog.tip.title"), JOptionPane.WARNING_MESSAGE);
                 return;
             }
 
+            if (!canTransformBody(request)) return;
             IRequestInfo info = Utils.helpers.analyzeRequest(request);
             List<String> headers = new ArrayList<>(info.getHeaders());
             byte[] body = Arrays.copyOfRange(request, info.getBodyOffset(), request.length);
+            if (contentTypeFromHeaders(headers).toLowerCase(Locale.ROOT).contains("json")) return;
             List<BodyField> fields = extractBodyFields(headers, body);
             if (fields.isEmpty()) {
-                JOptionPane.showMessageDialog(this, "无法从当前 body 提取可转换的普通参数", "提示",
+                JOptionPane.showMessageDialog(this, I18n.t("dialog.no_convertible_params"), I18n.t("dialog.tip.title"),
                         JOptionPane.INFORMATION_MESSAGE);
                 return;
             }
@@ -2546,7 +2426,7 @@ public class ManualWafPanel extends JPanel implements IMessageEditorController {
             byte[] jsonBody = buildJsonBody(fields);
             replaceBodyAndContentType(headers, jsonBody, "application/json");
         } catch (Exception e) {
-            JOptionPane.showMessageDialog(this, "JSON 转换错误: " + e.getMessage(), I18n.t("dialog.error.title"),
+            JOptionPane.showMessageDialog(this, I18n.t("dialog.error.json", e.getMessage()), I18n.t("dialog.error.title"),
                     JOptionPane.ERROR_MESSAGE);
         }
     }
@@ -2560,12 +2440,12 @@ public class ManualWafPanel extends JPanel implements IMessageEditorController {
         String ct = ctRaw.toLowerCase();
         Charset cs = charsetFromHeaders(headers);
         if (ct.contains("application/x-www-form-urlencoded")) {
-            fields.addAll(parseFormFields(new String(body, cs), cs));
+            fields.addAll(parseFormFields(TextCodec.decode(body, cs), cs));
         } else if (ct.contains("multipart/form-data")) {
             fields.addAll(parseMultipartFields(new String(body, StandardCharsets.ISO_8859_1),
                     boundaryFromContentType(ctRaw), cs));
         } else if (ct.contains("json")) {
-            fields.addAll(parseFlatJsonFields(new String(body, StandardCharsets.UTF_8)));
+            fields.addAll(parseFlatJsonFields(TextCodec.decode(body, cs)));
         }
         return fields;
     }
@@ -2595,6 +2475,7 @@ public class ManualWafPanel extends JPanel implements IMessageEditorController {
         String marker = "--" + boundary;
         String[] parts = body.split(Pattern.quote(marker));
         Pattern namePattern = Pattern.compile("(?i)\\bname=\"([^\"]*)\"");
+        Pattern filenamePattern = Pattern.compile("(?i)(?:^|;)\\s*filename\\*?\\s*=");
         for (String part : parts) {
             if (part == null || part.isEmpty() || part.startsWith("--"))
                 continue;
@@ -2607,8 +2488,8 @@ public class ManualWafPanel extends JPanel implements IMessageEditorController {
             if (sep < 0)
                 continue;
             String partHeaders = part.substring(0, sep);
-            if (partHeaders.toLowerCase().contains("filename="))
-                continue;
+            if (filenamePattern.matcher(partHeaders).find())
+                throw new IllegalArgumentException(I18n.t("dialog.body_file_conversion"));
             Matcher m = namePattern.matcher(partHeaders);
             if (!m.find())
                 continue;
@@ -2667,6 +2548,9 @@ public class ManualWafPanel extends JPanel implements IMessageEditorController {
                 inString = !inString;
                 cur.append(c);
                 continue;
+            }
+            if (!inString && (c == '{' || c == '[')) {
+                throw new IllegalArgumentException(I18n.t("dialog.body_nested_json"));
             }
             if (c == ',' && !inString) {
                 out.add(cur.toString());
@@ -2821,11 +2705,14 @@ public class ManualWafPanel extends JPanel implements IMessageEditorController {
     private String escapeJson(String s) {
         if (s == null)
             return "";
-        return s.replace("\\", "\\\\")
-                .replace("\"", "\\\"")
-                .replace("\r", "\\r")
-                .replace("\n", "\\n")
-                .replace("\t", "\\t");
+        StringBuilder out = new StringBuilder(s.length());
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            if (c == '\\' || c == '"') out.append('\\').append(c);
+            else if (c < 0x20) out.append(String.format("\\u%04x", (int)c));
+            else out.append(c);
+        }
+        return out.toString();
     }
 
     private String escapeMultipartName(String s) {
@@ -2853,15 +2740,13 @@ public class ManualWafPanel extends JPanel implements IMessageEditorController {
     }
 
     private Charset charsetFromHeaders(List<String> headers) {
-        String ct = contentTypeFromHeaders(headers);
-        Matcher m = Pattern.compile("(?i)charset\\s*=\\s*([^;\\r\\n]+)").matcher(ct);
-        if (m.find()) {
-            try {
-                return Charset.forName(m.group(1).trim());
-            } catch (Exception ignored) {
-            }
-        }
-        return StandardCharsets.UTF_8;
+        return RequestBodyPolicy.charset(String.join("\r\n", headers));
+    }
+
+    private boolean canTransformBody(byte[] request) {
+        if (RequestBodyPolicy.isEditable(request)) return true;
+        statusLabel.setText(I18n.t("manual.body_encoded"));
+        return false;
     }
 
     private String boundaryFromContentType(String ct) {
@@ -2876,14 +2761,15 @@ public class ManualWafPanel extends JPanel implements IMessageEditorController {
         if (sel != null && sel.length > 0) {
             try {
                 Charset charset = Charset.forName(charsetName);
-                String selected = new String(sel, StandardCharsets.ISO_8859_1);
-                replaceOccurrenceInRequest(sel, selected.getBytes(charset));
+                Charset source = isSelectionLikelyRequestLineOrHeader(sel) ? StandardCharsets.UTF_8
+                        : RequestBodyPolicy.charset(RequestBodyPolicy.headers(getRequestBytes()));
+                String selected = TextCodec.decode(sel, source);
+                replaceOccurrenceInRequest(sel, TextCodec.encode(selected, charset));
                 if (statusLabel != null) {
                     statusLabel.setText(I18n.t("status.applied_selection", charsetName));
                 }
             } catch (Exception e) {
-                JOptionPane.showMessageDialog(this, "编码错误: " + e.getMessage(), I18n.t("dialog.error.title"),
-                        JOptionPane.ERROR_MESSAGE);
+                statusLabel.setText(I18n.t("manual.text_failed"));
             }
             return;
         }
@@ -2892,25 +2778,24 @@ public class ManualWafPanel extends JPanel implements IMessageEditorController {
         try {
             RequestParts parts = splitRequestText(text);
             if (parts == null) {
-                JOptionPane.showMessageDialog(this, "未找到请求体", I18n.t("dialog.tip.title"), JOptionPane.WARNING_MESSAGE);
+                JOptionPane.showMessageDialog(this, I18n.t("dialog.body_missing"), I18n.t("dialog.tip.title"), JOptionPane.WARNING_MESSAGE);
                 return;
             }
             String lineEnd = parts.lineEnd;
             String headers = parts.headers;
-            String body = expandInlineTags(parts.body);
+            if (!RequestBodyPolicy.isEditable(headers)) {
+                statusLabel.setText(I18n.t("manual.body_encoded"));
+                return;
+            }
+            byte[] expanded = buildBodyBytesWithTags(parts.body, StandardCharsets.ISO_8859_1);
+            String body = TextCodec.decode(expanded, RequestBodyPolicy.charset(headers));
 
             if (body.isEmpty()) {
-                JOptionPane.showMessageDialog(this, "请求体为空", I18n.t("dialog.tip.title"), JOptionPane.WARNING_MESSAGE);
+                JOptionPane.showMessageDialog(this, I18n.t("dialog.body_empty"), I18n.t("dialog.tip.title"), JOptionPane.WARNING_MESSAGE);
                 return;
             }
-            if (looksBinaryBody(body)) {
-                JOptionPane.showMessageDialog(this, "当前请求体看起来已是二进制/已编码数据，请先 Reset 再进行字符集编码", "提示",
-                        JOptionPane.INFORMATION_MESSAGE);
-                return;
-            }
-
             Charset charset = Charset.forName(charsetName);
-            byte[] encoded = body.getBytes(charset);
+            byte[] encoded = TextCodec.encode(body, charset);
 
             String newHeaders = headers;
             if (newHeaders.toLowerCase().contains("content-type:")) {
@@ -2942,31 +2827,40 @@ public class ManualWafPanel extends JPanel implements IMessageEditorController {
                 statusLabel.setText(I18n.t("status.applied_body", charsetName));
             }
         } catch (Exception e) {
-            JOptionPane.showMessageDialog(this, "编码错误: " + e.getMessage(), I18n.t("dialog.error.title"),
-                    JOptionPane.ERROR_MESSAGE);
+            statusLabel.setText(I18n.t("manual.text_failed"));
         }
     }
 
     private void toUpper() {
-        transformSelection(String::toUpperCase);
+        transformSelection(s -> asciiCase(s, true));
     }
 
     private void toLower() {
-        transformSelection(String::toLowerCase);
+        transformSelection(s -> asciiCase(s, false));
+    }
+
+    private static String asciiCase(String text, boolean upper) {
+        StringBuilder result = new StringBuilder(text.length());
+        for (char c : text.toCharArray()) {
+            if (upper && c >= 'a' && c <= 'z') c -= 32;
+            else if (!upper && c >= 'A' && c <= 'Z') c += 32;
+            result.append(c);
+        }
+        return result.toString();
     }
 
     private void toRandomCase() {
         transformSelection(s -> {
             StringBuilder sb = new StringBuilder();
             for (char c : s.toCharArray()) {
-                sb.append(Math.random() > 0.5 ? Character.toUpperCase(c) : Character.toLowerCase(c));
+                sb.append(asciiCase(String.valueOf(c), Math.random() > 0.5));
             }
             return sb.toString();
         });
     }
 
     private void toFullwidth() {
-        transformSelection(s -> {
+        transformTextSelection(s -> {
             StringBuilder sb = new StringBuilder();
             for (char c : s.toCharArray()) {
                 if (c >= '!' && c <= '~')
@@ -2981,7 +2875,7 @@ public class ManualWafPanel extends JPanel implements IMessageEditorController {
     }
 
     private void toHomoglyph() {
-        transformSelection(s -> {
+        transformTextSelection(s -> {
             StringBuilder sb = new StringBuilder();
             for (char c : s.toCharArray()) {
                 sb.append(toHomoglyphChar(c));
@@ -3044,7 +2938,7 @@ public class ManualWafPanel extends JPanel implements IMessageEditorController {
     }
 
     private void insertZeroWidth() {
-        transformSelection(s -> {
+        transformTextSelection(s -> {
             if (s.length() <= 1) {
                 return s;
             }
@@ -3110,42 +3004,45 @@ public class ManualWafPanel extends JPanel implements IMessageEditorController {
         byte[] sel = getSelectedRequestBytes();
         if (sel == null || sel.length == 0) {
             JOptionPane.showMessageDialog(this,
-                    "请先选中要 Ghost 化的原始 payload",
+                    I18n.t("dialog.ghost_select_original"),
                     "Gh0st Bits", JOptionPane.INFORMATION_MESSAGE);
             return;
         }
-        String selected = decodeSelectedUtf8(sel, "Gh0st Bits");
-        if (selected == null) {
-            return;
-        }
-        if (GhostBitsCodec.containsLineBreak(selected) && GhostBitsCodec.mayEncodeLineBreak(strategy)) {
-            int ret = JOptionPane.showConfirmDialog(this,
-                    "当前选区包含换行。该策略可能把 CR/LF 也 Ghost 化，导致 HTTP 请求结构被破坏。\n是否继续？",
-                    "Gh0st Bits", JOptionPane.YES_NO_OPTION);
-            if (ret != JOptionPane.YES_OPTION) {
+        try {
+            Charset source = isSelectionLikelyRequestLineOrHeader(sel) ? StandardCharsets.UTF_8
+                    : RequestBodyPolicy.charset(RequestBodyPolicy.headers(getRequestBytes()));
+            String selected = TextCodec.decode(sel, source);
+            if (GhostBitsCodec.containsLineBreak(selected) && GhostBitsCodec.mayEncodeLineBreak(strategy)) {
+                int ret = JOptionPane.showConfirmDialog(this,
+                        I18n.t("dialog.ghost_line_breaks"),
+                        "Gh0st Bits", JOptionPane.YES_NO_OPTION);
+                if (ret != JOptionPane.YES_OPTION) {
+                    return;
+                }
+            }
+            String encoded = GhostBitsCodec.encode(selected, strategy, Utils.getGhostBitsEngine());
+            if (encoded.equals(selected)) {
+                if (statusLabel != null) {
+                    statusLabel.setText(I18n.t("status.ghost_no_change"));
+                }
                 return;
             }
-        }
-        String encoded = GhostBitsCodec.encode(selected, strategy, Utils.getGhostBitsEngine());
-        if (encoded.equals(selected)) {
-            if (statusLabel != null) {
-                statusLabel.setText(I18n.t("status.ghost_no_change"));
+            boolean rawRecommended = GhostBitsCodec.containsNonAscii(encoded) && isSelectionLikelyRequestLineOrHeader(sel);
+            if (!replaceOccurrenceInRequest(sel, TextCodec.encode(encoded, source))) {
+                return;
             }
-            return;
+            updateGhostStatus(encoded, GhostBitsCodec.fold(encoded, ghostFoldMode),
+                    rawRecommended);
+        } catch (java.nio.charset.CharacterCodingException | IllegalArgumentException invalid) {
+            statusLabel.setText(I18n.t("manual.text_failed"));
         }
-        boolean rawRecommended = GhostBitsCodec.containsNonAscii(encoded) && isSelectionLikelyRequestLineOrHeader(sel);
-        if (!replaceOccurrenceInRequest(sel, encoded.getBytes(StandardCharsets.UTF_8))) {
-            return;
-        }
-        updateGhostStatus(encoded, GhostBitsCodec.fold(encoded, ghostFoldMode),
-                rawRecommended);
     }
 
     private void randomizeGhostSelection() {
         byte[] sel = getSelectedRequestBytes();
         if (sel == null || sel.length == 0) {
             JOptionPane.showMessageDialog(this,
-                    "请先选中已 Ghost 化或待 Ghost 化的文本",
+                    I18n.t("dialog.ghost_select_shuffle"),
                     "Gh0st Bits", JOptionPane.INFORMATION_MESSAGE);
             return;
         }
@@ -3189,15 +3086,15 @@ public class ManualWafPanel extends JPanel implements IMessageEditorController {
         String foldedBefore = GhostBitsCodec.fold(before, ghostFoldMode);
         sb.append("Fold:   ").append(GhostBitsCodec.foldModeLabel(ghostFoldMode)).append('\n');
         sb.append('\n');
-        sb.append("换组前: ").append(truncateForPreview(before)).append('\n');
-        sb.append("换组后: ").append(truncateForPreview(after)).append('\n');
+        sb.append(I18n.t("ghost.shuffle.before")).append(truncateForPreview(before)).append('\n');
+        sb.append(I18n.t("ghost.shuffle.after")).append(truncateForPreview(after)).append('\n');
         sb.append('\n');
-        sb.append("还原前: ").append(truncateForPreview(escape(foldedBefore))).append('\n');
-        sb.append("还原后: ").append(truncateForPreview(escape(folded)));
+        sb.append(I18n.t("ghost.fold.before")).append(truncateForPreview(escape(foldedBefore))).append('\n');
+        sb.append(I18n.t("ghost.fold.after")).append(truncateForPreview(escape(folded)));
         if (foldedBefore.equals(folded)) {
-            sb.append("  (不变)");
+            sb.append(I18n.t("ghost.fold.unchanged"));
         } else {
-            sb.append("  (! 已改变)");
+            sb.append(I18n.t("ghost.fold.changed"));
         }
         sb.append('\n');
         if (rawRecommended) {
@@ -3233,7 +3130,7 @@ public class ManualWafPanel extends JPanel implements IMessageEditorController {
         String selected = new String(selectedBytes, StandardCharsets.UTF_8);
         if (!Arrays.equals(selected.getBytes(StandardCharsets.UTF_8), selectedBytes)) {
             JOptionPane.showMessageDialog(this,
-                    "当前选区不是有效 UTF-8 文本。Gh0st Bits 只处理 ASCII/UTF-8 文本选区，避免破坏二进制 body。",
+                    I18n.t("dialog.ghost_invalid_utf8"),
                     title, JOptionPane.INFORMATION_MESSAGE);
             return null;
         }
@@ -3252,15 +3149,12 @@ public class ManualWafPanel extends JPanel implements IMessageEditorController {
                 return tip;
             }
         };
-        btn.setMargin(new Insets(0, 7, 0, 7));
+        btn.setMargin(new Insets(3, 7, 3, 7));
         btn.setFont(new Font(Font.SANS_SERIF, Font.PLAIN, 10));
         btn.setFocusPainted(false);
         if (tooltip != null && !tooltip.isEmpty()) {
             btn.setToolTipText(tooltip);
         }
-        Dimension pref = btn.getPreferredSize();
-        btn.setPreferredSize(new Dimension(pref.width, 24));
-        btn.setMaximumSize(new Dimension(Integer.MAX_VALUE, 24));
         btn.addActionListener(e -> setGhostFoldMode(mode));
         return btn;
     }
@@ -3333,7 +3227,7 @@ public class ManualWafPanel extends JPanel implements IMessageEditorController {
         byte[] sel = getSelectedRequestBytes();
         if (sel == null || sel.length == 0) {
             JOptionPane.showMessageDialog(this,
-                    "请先选中要替换的位置",
+                    I18n.t("dialog.select_replacement"),
                     "Gh0st Bits", JOptionPane.INFORMATION_MESSAGE);
             return;
         }
@@ -3351,7 +3245,7 @@ public class ManualWafPanel extends JPanel implements IMessageEditorController {
         byte[] sel = getSelectedRequestBytes();
         if (sel == null || sel.length == 0) {
             JOptionPane.showMessageDialog(this,
-                    "请先选中要替换的位置",
+                    I18n.t("dialog.select_replacement"),
                     "Gh0st Bits", JOptionPane.INFORMATION_MESSAGE);
             return;
         }
@@ -3392,7 +3286,7 @@ public class ManualWafPanel extends JPanel implements IMessageEditorController {
         }
         if (!changed) {
             JOptionPane.showMessageDialog(this,
-                    "Jetty %2> 只处理点号 token。请选中 .、%2e，或包含这些 token 的路径片段。",
+                    I18n.t("dialog.jetty_select"),
                     "ParserBypass", JOptionPane.INFORMATION_MESSAGE);
         }
         return changed ? sb.toString() : s;
@@ -3440,7 +3334,7 @@ public class ManualWafPanel extends JPanel implements IMessageEditorController {
         byte[] sel = getSelectedRequestBytes();
         if (sel == null || sel.length == 0) {
             JOptionPane.showMessageDialog(this,
-                    "请先选中 filename* 中要隐藏的原始字符，例如 j 或 .jsp",
+                    I18n.t("dialog.tomcat_select"),
                     "ParserBypass", JOptionPane.INFORMATION_MESSAGE);
             return;
         }
@@ -3450,15 +3344,13 @@ public class ManualWafPanel extends JPanel implements IMessageEditorController {
         }
         if (looksLikeRawHexBytes(selected)) {
             int choice = JOptionPane.showOptionDialog(this,
-                    "Tomcat %HH 接收原始字符，不接收 hex 字符串。\n"
-                            + "例如要隐藏 j，请选中 j；不要选中 6a。\n\n"
-                            + "如果继续，工具会把字符 " + selected + " 本身逐字节编码。",
+                    I18n.t("dialog.tomcat_hex_input", selected),
                     "Tomcat %HH",
                     JOptionPane.DEFAULT_OPTION,
                     JOptionPane.WARNING_MESSAGE,
                     null,
-                    new Object[]{"取消", "继续按原文编码"},
-                    "取消");
+                    new Object[]{I18n.t("dialog.cancel"), I18n.t("dialog.encode_original")},
+                    I18n.t("dialog.cancel"));
             if (choice != 1) {
                 return;
             }
@@ -3476,7 +3368,7 @@ public class ManualWafPanel extends JPanel implements IMessageEditorController {
         if (statusLabel != null) {
             statusLabel.setText("ParserBypass: Tomcat %HH applied | input is raw char, not 6a hex text");
         }
-        updateGhostSelectionFoldPreview(replaced, GhostBitsCodec.fold(replaced, ghostFoldMode), false);
+        showParserPreview("Tomcat %HH", replaced);
     }
 
     private boolean looksLikeRawHexBytes(String s) {
@@ -3496,28 +3388,47 @@ public class ManualWafPanel extends JPanel implements IMessageEditorController {
         byte[] sel = getSelectedRequestBytes();
         if (sel == null || sel.length == 0) {
             JOptionPane.showMessageDialog(this,
-                    "请先选中要处理的解析差异片段",
+                    I18n.t("dialog.select_parser"),
                     "ParserBypass", JOptionPane.INFORMATION_MESSAGE);
             return;
         }
-        String selected = decodeSelectedUtf8(sel, "ParserBypass");
-        if (selected == null) {
-            return;
-        }
-        String replaced = transformer.apply(selected);
-        if (replaced == null || replaced.equals(selected)) {
-            if (statusLabel != null) {
-                statusLabel.setText("ParserBypass: " + name + " did not change selection");
+        try {
+            Charset source = isSelectionLikelyRequestLineOrHeader(sel) ? StandardCharsets.UTF_8
+                    : RequestBodyPolicy.charset(RequestBodyPolicy.headers(getRequestBytes()));
+            String selected = TextCodec.decode(sel, source);
+            String replaced = transformer.apply(selected);
+            if (replaced == null || replaced.equals(selected)) {
+                if (statusLabel != null) {
+                    statusLabel.setText("ParserBypass: " + name + " did not change selection");
+                }
+                return;
             }
-            return;
+            byte[] encoded = TextCodec.encode(replaced, source);
+            if (!replaceOccurrenceInRequest(sel, encoded)) {
+                return;
+            }
+            if (statusLabel != null) {
+                statusLabel.setText("ParserBypass: " + name + " applied");
+            }
+            showParserPreview(name, replaced, encoded);
+        } catch (java.nio.charset.CharacterCodingException | IllegalArgumentException invalid) {
+            statusLabel.setText(I18n.t("manual.text_failed"));
         }
-        if (!replaceOccurrenceInRequest(sel, replaced.getBytes(StandardCharsets.UTF_8))) {
-            return;
-        }
-        if (statusLabel != null) {
-            statusLabel.setText("ParserBypass: " + name + " applied");
-        }
-        updateGhostSelectionFoldPreview(replaced, GhostBitsCodec.fold(replaced, ghostFoldMode), false);
+    }
+
+    private void showParserPreview(String name, String payload) {
+        showParserPreview(name, payload, payload.getBytes(StandardCharsets.UTF_8));
+    }
+
+    private void showParserPreview(String name, String payload, byte[] bytes) {
+        parserPreviewName = name;
+        parserPreviewPayload = payload;
+        parserPreviewBytes = bytes;
+        ParserPreview.Result preview = ParserPreview.evaluate(name, payload);
+        ghostSelectionFoldLabel.setText(I18n.t("parser.preview") + ": " + truncateForInspector(escape(payload), 42)
+                + " -> " + (preview.value == null ? "?" : truncateForInspector(escape(preview.value), 42)));
+        ghostPreviewRiskLabel.setText(preview.mechanism + " | " + I18n.t("parser.local_model"));
+        ghostPreviewRiskLabel.setForeground(UIManager.getColor("Label.foreground"));
     }
 
     private String replaceAsciiDigitsWithUnicodeDigits(String s) {
@@ -3557,8 +3468,9 @@ public class ManualWafPanel extends JPanel implements IMessageEditorController {
             return s;
         }
         StringBuilder sb = new StringBuilder(s.length() * 6);
+        GhostBitsEngine engine = Utils.getGhostBitsEngine();
         for (int i = 0; i < s.length(); i++) {
-            sb.append("\\u").append(ghostEncodeHexDigits(String.format("%04x", (int) s.charAt(i))));
+            sb.append("\\u").append(ghostEncodeHexDigits(String.format("%04x", (int) s.charAt(i)), engine));
         }
         return sb.toString();
     }
@@ -3568,11 +3480,12 @@ public class ManualWafPanel extends JPanel implements IMessageEditorController {
             return s;
         }
         StringBuilder sb = new StringBuilder(s.length());
+        GhostBitsEngine engine = Utils.getGhostBitsEngine();
         for (int i = 0; i < s.length(); i++) {
             if (i + 5 < s.length() && s.charAt(i) == '\\' && s.charAt(i + 1) == 'u'
                     && isFourAsciiHexDigits(s, i + 2)) {
                 sb.append("\\u");
-                sb.append(ghostEncodeHexDigits(s.substring(i + 2, i + 6)));
+                sb.append(ghostEncodeHexDigits(s.substring(i + 2, i + 6), engine));
                 i += 5;
             } else {
                 sb.append(s.charAt(i));
@@ -3593,12 +3506,12 @@ public class ManualWafPanel extends JPanel implements IMessageEditorController {
         return true;
     }
 
-    private String ghostEncodeHexDigits(String hex) {
+    private String ghostEncodeHexDigits(String hex, GhostBitsEngine engine) {
         StringBuilder sb = new StringBuilder(hex.length());
         for (int i = 0; i < hex.length(); i++) {
             char c = Character.toLowerCase(hex.charAt(i));
             if (c <= 0x7F && Character.digit(c, 16) >= 0) {
-                sb.append(GhostBitsCodec.pickGhostChar(c, Utils.getGhostBitsEngine()));
+                sb.append(GhostBitsCodec.pickGhostChar(c, engine));
             } else {
                 sb.append(c);
             }
@@ -3655,8 +3568,10 @@ public class ManualWafPanel extends JPanel implements IMessageEditorController {
         if (req == null || sel == null || sel.length == 0) {
             return false;
         }
-        List<Integer> positions = findAllOccurrences(req, sel);
         int headerEnd = findHeaderEnd(req);
+        Integer selectedIndex = resolveSelectionIndex(req, sel);
+        if (selectedIndex != null) return headerEnd < 0 || selectedIndex < headerEnd;
+        List<Integer> positions = findAllOccurrences(req, sel);
         for (int pos : positions) {
             if (headerEnd < 0 || pos < headerEnd) {
                 return true;
@@ -3669,7 +3584,7 @@ public class ManualWafPanel extends JPanel implements IMessageEditorController {
         byte[] sel = getSelectedRequestBytes();
         if (sel == null || sel.length == 0) {
             JOptionPane.showMessageDialog(this,
-                    "请先选中一个 ASCII 字符（如 . / % / @ / \\r / \\n）",
+                    I18n.t("dialog.select_ascii"),
                     I18n.t("dialog.tip.title"), JOptionPane.INFORMATION_MESSAGE);
             return;
         }
@@ -3697,9 +3612,9 @@ public class ManualWafPanel extends JPanel implements IMessageEditorController {
 
     private void showGhostLookup(String target, List<String> candidates) {
         StringBuilder sb = new StringBuilder();
-        sb.append("字符: ").append(escape(target)).append("  0x")
+        sb.append(I18n.t("ghost.character")).append(escape(target)).append("  0x")
                 .append(String.format("%02X", target.charAt(0) & 0xFF)).append('\n');
-        sb.append("模式: ").append(GhostBitsCodec.foldModeLabel(ghostFoldMode)).append("\n\n");
+        sb.append(I18n.t("ghost.mode")).append(GhostBitsCodec.foldModeLabel(ghostFoldMode)).append("\n\n");
         int max = Math.min(candidates.size(), 24);
         for (int i = 0; i < max; i++) {
             String c = candidates.get(i);
@@ -3722,7 +3637,7 @@ public class ManualWafPanel extends JPanel implements IMessageEditorController {
         String rendered = Utils.getGhostBitsEngine().renderTemplate(t.getId());
         if (rendered == null || rendered.isEmpty()) {
             JOptionPane.showMessageDialog(this,
-                    "模板 " + t.getId() + " 渲染结果为空，请检查 YAML pattern",
+                    I18n.t("dialog.template_empty", t.getId()),
                     "Gh0st Bits Template", JOptionPane.WARNING_MESSAGE);
             return;
         }
@@ -3755,8 +3670,12 @@ public class ManualWafPanel extends JPanel implements IMessageEditorController {
                 || (GhostBitsCodec.containsNonAscii(rendered) && ("path".equals(target) || "header".equals(target)
                         || "header_value".equals(target)));
         updateGhostStatus(rendered, GhostBitsCodec.fold(rendered, ghostFoldMode), rawRecommended);
+        String id = t.getId();
+        if (id.contains("unicode_digit") || id.contains("fullwidth") || id.contains("loose_hex")
+                || id.contains("x_escape") || id.contains("char_to_hex") || id.equals("tomcat_url_hex_ghost"))
+            showParserPreview(id, rendered);
         if (statusLabel != null) {
-            statusLabel.setText(statusLabel.getText() + " | Template: " + t.getLabel());
+            statusLabel.setText(statusLabel.getText() + " | Template: " + I18n.t(t.getLabel()));
         }
     }
 
@@ -3766,7 +3685,7 @@ public class ManualWafPanel extends JPanel implements IMessageEditorController {
     private void applyTemplateToPath(GhostBitsRule.Template t, byte[] payload, String rendered) {
         byte[] req = getRequestBytes();
         if (req == null || req.length == 0) {
-            JOptionPane.showMessageDialog(this, "请求为空", I18n.t("dialog.tip.title"), JOptionPane.WARNING_MESSAGE);
+            JOptionPane.showMessageDialog(this, I18n.t("dialog.request_empty"), I18n.t("dialog.tip.title"), JOptionPane.WARNING_MESSAGE);
             return;
         }
 
@@ -3783,7 +3702,7 @@ public class ManualWafPanel extends JPanel implements IMessageEditorController {
             }
         }
         if (lineEnd <= 0) {
-            JOptionPane.showMessageDialog(this, "未识别请求行", I18n.t("dialog.tip.title"), JOptionPane.WARNING_MESSAGE);
+            JOptionPane.showMessageDialog(this, I18n.t("dialog.request_line_missing"), I18n.t("dialog.tip.title"), JOptionPane.WARNING_MESSAGE);
             return;
         }
 
@@ -3800,7 +3719,7 @@ public class ManualWafPanel extends JPanel implements IMessageEditorController {
             }
         }
         if (firstSpace < 0 || secondSpace < 0) {
-            JOptionPane.showMessageDialog(this, "请求行格式不规范，无法定位 path", "提示",
+            JOptionPane.showMessageDialog(this, I18n.t("dialog.path_not_found"), I18n.t("dialog.tip.title"),
                     JOptionPane.WARNING_MESSAGE);
             return;
         }
@@ -3816,7 +3735,7 @@ public class ManualWafPanel extends JPanel implements IMessageEditorController {
 
         setRequestBytes(out);
         if (statusLabel != null) {
-            statusLabel.setText("Template applied (path) | " + t.getLabel());
+            statusLabel.setText("Template applied (path) | " + I18n.t(t.getLabel()));
         }
     }
 
@@ -3826,7 +3745,7 @@ public class ManualWafPanel extends JPanel implements IMessageEditorController {
     private void applyTemplateToFilename(GhostBitsRule.Template t, byte[] payload, String rendered) {
         byte[] req = getRequestBytes();
         if (req == null || req.length == 0) {
-            JOptionPane.showMessageDialog(this, "请求为空", I18n.t("dialog.tip.title"), JOptionPane.WARNING_MESSAGE);
+            JOptionPane.showMessageDialog(this, I18n.t("dialog.request_empty"), I18n.t("dialog.tip.title"), JOptionPane.WARNING_MESSAGE);
             return;
         }
 
@@ -3857,8 +3776,8 @@ public class ManualWafPanel extends JPanel implements IMessageEditorController {
 
         if (valueStart < 0) {
             int ret = JOptionPane.showConfirmDialog(this,
-                    "未在请求中找到 filename= 段。\n是否回退为「替换当前选中文本」？",
-                    "filename 定位失败", JOptionPane.YES_NO_OPTION);
+                    I18n.t("dialog.filename_fallback"),
+                    I18n.t("dialog.filename_missing.title"), JOptionPane.YES_NO_OPTION);
             if (ret == JOptionPane.YES_OPTION) {
                 applyTemplateToSelection(t, payload, rendered);
             }
@@ -3872,7 +3791,7 @@ public class ManualWafPanel extends JPanel implements IMessageEditorController {
 
         setRequestBytes(out);
         if (statusLabel != null) {
-            statusLabel.setText("Template applied (filename) | " + t.getLabel());
+            statusLabel.setText("Template applied (filename) | " + I18n.t(t.getLabel()));
         }
     }
 
@@ -3891,7 +3810,7 @@ public class ManualWafPanel extends JPanel implements IMessageEditorController {
     private void applyTemplateToHeaderValue(GhostBitsRule.Template t, byte[] payload, String rendered) {
         byte[] req = getRequestBytes();
         if (req == null || req.length == 0) {
-            JOptionPane.showMessageDialog(this, "请求为空", I18n.t("dialog.tip.title"), JOptionPane.WARNING_MESSAGE);
+            JOptionPane.showMessageDialog(this, I18n.t("dialog.request_empty"), I18n.t("dialog.tip.title"), JOptionPane.WARNING_MESSAGE);
             return;
         }
 
@@ -3910,10 +3829,10 @@ public class ManualWafPanel extends JPanel implements IMessageEditorController {
 
         Object[] options = headerNames.toArray();
         Object choice = options.length == 0
-                ? JOptionPane.showInputDialog(this, "输入 header 名:", t.getLabel(),
+                ? JOptionPane.showInputDialog(this, I18n.t("dialog.header_name"), I18n.t(t.getLabel()),
                         JOptionPane.QUESTION_MESSAGE)
-                : JOptionPane.showInputDialog(this, "选择要替换 value 的 header:",
-                        t.getLabel(), JOptionPane.QUESTION_MESSAGE, null, options, options[0]);
+                : JOptionPane.showInputDialog(this, I18n.t("dialog.header_choose"),
+                        I18n.t(t.getLabel()), JOptionPane.QUESTION_MESSAGE, null, options, options[0]);
         if (choice == null)
             return;
         String headerName = choice.toString().trim();
@@ -3925,7 +3844,7 @@ public class ManualWafPanel extends JPanel implements IMessageEditorController {
         String full = new String(req, StandardCharsets.ISO_8859_1);
         Matcher mm = p.matcher(full);
         if (!mm.find()) {
-            JOptionPane.showMessageDialog(this, "未找到 header: " + headerName,
+            JOptionPane.showMessageDialog(this, I18n.t("dialog.header_missing", headerName),
                     I18n.t("dialog.tip.title"), JOptionPane.WARNING_MESSAGE);
             return;
         }
@@ -3939,7 +3858,7 @@ public class ManualWafPanel extends JPanel implements IMessageEditorController {
 
         setRequestBytes(out);
         if (statusLabel != null) {
-            statusLabel.setText("Template applied (header " + headerName + ") | " + t.getLabel());
+            statusLabel.setText("Template applied (header " + headerName + ") | " + I18n.t(t.getLabel()));
         }
     }
 
@@ -3953,8 +3872,7 @@ public class ManualWafPanel extends JPanel implements IMessageEditorController {
             return;
         }
         JOptionPane.showMessageDialog(this,
-                "模板已生成，请先选中要替换的位置（target=" + t.getTarget() + "）后再应用：\n\n"
-                        + rendered,
+                I18n.t("dialog.template_preview", t.getTarget(), rendered),
                 "Template Preview", JOptionPane.INFORMATION_MESSAGE);
     }
 
@@ -3962,7 +3880,7 @@ public class ManualWafPanel extends JPanel implements IMessageEditorController {
         byte[] sel = getSelectedRequestBytes();
         if (sel == null || sel.length == 0) {
             JOptionPane.showMessageDialog(this,
-                    "请先选中要预览的 Gh0st Bits 文本",
+                    I18n.t("dialog.ghost_select_preview"),
                     "Fold Preview", JOptionPane.INFORMATION_MESSAGE);
             return;
         }
@@ -3996,22 +3914,37 @@ public class ManualWafPanel extends JPanel implements IMessageEditorController {
     private void transformSelection(java.util.function.Function<String, String> transformer) {
         byte[] sel = getSelectedRequestBytes();
         if (sel == null || sel.length == 0) {
-            JOptionPane.showMessageDialog(this, "请先选中要变换的文本", I18n.t("dialog.tip.title"),
+            JOptionPane.showMessageDialog(this, I18n.t("dialog.select_transform"), I18n.t("dialog.tip.title"),
                     JOptionPane.INFORMATION_MESSAGE);
             return;
         }
         String selected = new String(sel, StandardCharsets.ISO_8859_1);
         String replaced = transformer.apply(selected);
         if (replaced == null || replaced.equals(selected)) {
-            String msg = "当前操作对选区没有产生变化。\n\n"
-                    + "常见原因：选区字符在该规则下属于安全字符，或已经符合目标形态。";
-            JOptionPane.showMessageDialog(this, msg, I18n.t("dialog.tip.title"),
-                    JOptionPane.INFORMATION_MESSAGE);
-            if (statusLabel != null)
-                statusLabel.setText("No change: operation left selection unchanged");
+            String msg = I18n.t("dialog.selection_unchanged");
+            if (statusLabel != null) statusLabel.setText(msg);
             return;
         }
-        replaceOccurrenceInRequest(sel, replaced.getBytes(StandardCharsets.ISO_8859_1));
+        try {
+            replaceOccurrenceInRequest(sel, TextCodec.encode(replaced, StandardCharsets.ISO_8859_1));
+        } catch (java.nio.charset.CharacterCodingException invalid) {
+            statusLabel.setText(I18n.t("manual.text_failed"));
+        }
+    }
+
+    private void transformTextSelection(java.util.function.Function<String, String> transformer) {
+        byte[] selected = getSelectedRequestBytes();
+        if (selected.length == 0) return;
+        try {
+            Charset source = isSelectionLikelyRequestLineOrHeader(selected) ? StandardCharsets.UTF_8
+                    : RequestBodyPolicy.charset(RequestBodyPolicy.headers(getRequestBytes()));
+            String text = TextCodec.decode(selected, source);
+            String replacement = transformer.apply(text);
+            if (replacement != null && !replacement.equals(text))
+                replaceOccurrenceInRequest(selected, TextCodec.encode(replacement, source));
+        } catch (Exception invalid) {
+            statusLabel.setText(I18n.t("manual.text_failed"));
+        }
     }
 
     private void transformSelectionWithNoChangeOption(
@@ -4020,7 +3953,7 @@ public class ManualWafPanel extends JPanel implements IMessageEditorController {
             java.util.function.Function<String, String> fallbackTransformer) {
         byte[] sel = getSelectedRequestBytes();
         if (sel == null || sel.length == 0) {
-            JOptionPane.showMessageDialog(this, "请先选中要变换的文本", I18n.t("dialog.tip.title"),
+            JOptionPane.showMessageDialog(this, I18n.t("dialog.select_transform"), I18n.t("dialog.tip.title"),
                     JOptionPane.INFORMATION_MESSAGE);
             return;
         }
@@ -4052,8 +3985,9 @@ public class ManualWafPanel extends JPanel implements IMessageEditorController {
         replaceOccurrenceInRequest(sel, replaced.getBytes(StandardCharsets.ISO_8859_1));
     }
 
-    private void runRequestMutation(Runnable action) {
-        byte[] before = getRequestBytes();
+    private void runRequestMutation(Runnable action, String name) {
+        byte[] before = getRequestBytes().clone();
+        reconcileTransformations(before);
         CaretSnapshot caret = captureRequestCaret();
         pendingRequestCaretPosition = null;
         action.run();
@@ -4061,6 +3995,9 @@ public class ManualWafPanel extends JPanel implements IMessageEditorController {
         if (!Arrays.equals(before, after)) {
             pushUndo(before);
             redoStack.clear();
+            if (Arrays.equals(after, originalRequest)) transformations.clear();
+            else transformations.add(name);
+            transformationBytes = after.clone();
             updateUndoRedoButtons();
             if (pendingRequestCaretPosition != null) {
                 restoreRequestCaretAt(pendingRequestCaretPosition, after.length);
@@ -4072,11 +4009,67 @@ public class ManualWafPanel extends JPanel implements IMessageEditorController {
         refreshRequestInspector();
     }
 
+    private void reconcileTransformations(byte[] request) {
+        if (Arrays.equals(request, transformationBytes)) return;
+        if (Arrays.equals(request, originalRequest)) transformations.clear();
+        else if (transformations.isEmpty() || !I18n.t("manual.steps.edit").equals(transformations.get(transformations.size() - 1)))
+            transformations.add(I18n.t("manual.steps.edit"));
+        transformationBytes = request.clone();
+    }
+
+    private String transformationSummary() {
+        return transformations.isEmpty() ? I18n.t("manual.steps.original") : String.join(" → ", transformations);
+    }
+
+    private void updateTransformationLabel() {
+        if (operationSequenceLabel == null) return;
+        String steps = I18n.t("manual.steps", transformationSummary());
+        operationSequenceLabel.setText(getRequestBytes().length == 0 ? I18n.t("manual.request.empty_short")
+                : truncateForInspector(steps, 110));
+        operationSequenceLabel.setToolTipText(steps + " | " + I18n.t("manual.steps.tip"));
+    }
+
+    private void restoreRequestState(RequestState state) {
+        setRequestBytes(state.bytes);
+        transformations = new ArrayList<>(state.transformations);
+        transformationBytes = state.bytes.clone();
+    }
+
+    private static boolean sameTarget(IHttpService first, IHttpService second) {
+        return first != null && second != null && first.getHost().equalsIgnoreCase(second.getHost())
+                && first.getPort() == second.getPort() && first.getProtocol().equalsIgnoreCase(second.getProtocol());
+    }
+
+    private boolean baselineSettingsMatch(IHttpService service, boolean raw, boolean follow, int max) {
+        return baselineRun != null && sameTarget(baselineRun.service, service) && baselineRun.raw == raw
+                && baselineRun.followRedirect == (follow && !raw) && (!follow || raw || baselineRun.maxRedirects == max);
+    }
+
+    private void showSelectedResponse() {
+        boolean baseline = responseChoice.getSelectedIndex() == 1;
+        responseViewer.setMessage(baseline ? baselineResponseBytes : currentResponseBytes, false);
+        String context = baseline ? I18n.t("manual.response.baseline")
+                : I18n.t(currentResponseBytes.length == 0 ? "manual.response.none_short"
+                : Arrays.equals(getRequestBytes(), responseRequestBytes) ? "manual.response.current_short" : "manual.response.previous_short");
+        if (baseline && baselineRun != null) context += " | " + targetText(baselineRun.service) + " | " + (baselineRun.raw ? "Raw" : "Burp");
+        responseContextLabel.setText(truncateForInspector(context, 130));
+        responseContextLabel.setToolTipText(currentResponseBytes.length == 0 && !baseline
+                ? I18n.t(getRequestBytes().length == 0 ? "manual.response.empty" : "manual.response.not_sent")
+                : context + (baseline ? "" : " | " + currentResponseSteps));
+        responseComparisonLabel.setVisible(!baseline && !currentComparisonText.isEmpty());
+        responseComparisonLabel.setText(truncateForInspector(currentComparisonText, 130));
+        responseComparisonLabel.setToolTipText(currentComparisonText);
+        baselineStatusLabel.setText(truncateForInspector(baselineCheckText, 130));
+        baselineStatusLabel.setToolTipText(baselineCheckText);
+        baselineDetails.setVisible(originalRequest.length > 0);
+        baselineDetails.revalidate();
+    }
+
     private void pushUndo(byte[] state) {
         if (state == null) {
             state = new byte[0];
         }
-        undoStack.push(Arrays.copyOf(state, state.length));
+        undoStack.push(new RequestState(state, transformations));
         if (undoStack.size() > MAX_UNDO_STEPS) {
             undoStack.remove(0);
         }
@@ -4086,7 +4079,7 @@ public class ManualWafPanel extends JPanel implements IMessageEditorController {
         if (state == null) {
             state = new byte[0];
         }
-        redoStack.push(Arrays.copyOf(state, state.length));
+        redoStack.push(new RequestState(state, transformations));
         if (redoStack.size() > MAX_REDO_STEPS) {
             redoStack.remove(0);
         }
@@ -4187,11 +4180,12 @@ public class ManualWafPanel extends JPanel implements IMessageEditorController {
     // --- Undo/Redo ---
     private void undo() {
         if (!undoStack.isEmpty()) {
+            reconcileTransformations(getRequestBytes());
             CaretSnapshot caret = captureRequestCaret();
             pushRedo(getRequestBytes());
-            byte[] prev = undoStack.pop();
-            setRequestBytes(prev);
-            restoreRequestCaret(caret, prev.length);
+            RequestState prev = undoStack.pop();
+            restoreRequestState(prev);
+            restoreRequestCaret(caret, prev.bytes.length);
             updateUndoRedoButtons();
             refreshRequestInspector();
         }
@@ -4199,11 +4193,12 @@ public class ManualWafPanel extends JPanel implements IMessageEditorController {
 
     private void redo() {
         if (!redoStack.isEmpty()) {
+            reconcileTransformations(getRequestBytes());
             CaretSnapshot caret = captureRequestCaret();
             pushUndo(getRequestBytes());
-            byte[] next = redoStack.pop();
-            setRequestBytes(next);
-            restoreRequestCaret(caret, next.length);
+            RequestState next = redoStack.pop();
+            restoreRequestState(next);
+            restoreRequestCaret(caret, next.bytes.length);
             updateUndoRedoButtons();
             refreshRequestInspector();
         }
@@ -4216,9 +4211,12 @@ public class ManualWafPanel extends JPanel implements IMessageEditorController {
                 return;
             }
             CaretSnapshot caret = captureRequestCaret();
+            reconcileTransformations(before);
             pushUndo(before);
             redoStack.clear();
             setRequestBytes(originalRequest);
+            transformations.clear();
+            transformationBytes = originalRequest.clone();
             restoreRequestCaret(caret, originalRequest.length);
             updateUndoRedoButtons();
             refreshRequestInspector();
@@ -4227,414 +4225,191 @@ public class ManualWafPanel extends JPanel implements IMessageEditorController {
 
     // --- Send ---
     private void sendRequest() {
-        String host = hostField == null ? "" : hostField.getText().trim();
-        String portStr = portField == null ? "" : portField.getText().trim();
-        if (host.isEmpty()) {
-            JOptionPane.showMessageDialog(this, "Host 不能为空", I18n.t("dialog.tip.title"), JOptionPane.WARNING_MESSAGE);
-            return;
-        }
+        sendRequest(false);
+    }
+
+    private void sendRequest(boolean baseline) {
+        if (activeSend != null) return;
+        String host = hostField.getText().trim();
         int port;
         try {
-            port = Integer.parseInt(portStr);
-        } catch (Exception e) {
-            JOptionPane.showMessageDialog(this, "端口号必须是数字", I18n.t("dialog.tip.title"), JOptionPane.WARNING_MESSAGE);
+            port = Integer.parseInt(portField.getText().trim());
+            if (port < 1 || port > 65535) throw new NumberFormatException();
+        } catch (NumberFormatException e) {
+            statusLabel.setText(I18n.t("manual.port_range"));
             return;
         }
-        String protocol = (httpsCheckBox != null && httpsCheckBox.isSelected()) ? "https" : "http";
-        IHttpService targetService = Utils.helpers.buildHttpService(host, port, protocol);
-        currentHttpService = targetService;
-
-        byte[] rawReq = getRequestBytes();
-        if (rawReq == null || rawReq.length == 0) {
-            JOptionPane.showMessageDialog(this, "请求内容为空", I18n.t("dialog.tip.title"), JOptionPane.WARNING_MESSAGE);
+        byte[] editor = (baseline ? originalRequest : getRequestBytes()).clone();
+        if (host.isEmpty() || editor.length == 0) {
+            statusLabel.setText(I18n.t(host.isEmpty() ? "dialog.host_empty" : "dialog.request_content_empty"));
             return;
         }
-
-        final boolean followRedirect = followRedirectCheckBox != null && followRedirectCheckBox.isSelected();
-        isCancelled = false;
-
-        long startNs = System.nanoTime();
-        if (statusLabel != null) {
-            statusLabel.setText(I18n.t("status.sending"));
-        }
-
-        if (sendBtn != null) {
+        try {
+            IHttpService service = Utils.helpers.buildHttpService(host, port, httpsCheckBox.isSelected() ? "https" : "http");
+            reconcileTransformations(getRequestBytes());
+            byte[] wire = baseline ? editor.clone() : buildRequestBytesForSending(editor);
+            boolean raw = shouldUseRawSocket(wire);
+            boolean follow = followRedirectCheckBox.isSelected();
+            int max = Utils.getConfigMaxRedirects(3);
+            boolean matchingReplay = baselineSettingsMatch(service, raw, follow, max);
+            byte[] reference = matchingReplay
+                    ? baselineResponseBytes
+                    : baseline && !raw && sameTarget(originalHttpService, service) ? capturedResponseBytes : null;
+            SendRun run = new SendRun(service, editor, wire, raw, follow, max, baseline,
+                    baseline ? I18n.t("manual.steps.original") : transformationSummary(),
+                    reference == null || reference.length == 0 ? null
+                            : new BypassMain.SimpleHttpRequestResponse(service, originalRequest.clone(), reference.clone()), matchingReplay);
+            activeSend = run;
+            if (!baseline) {
+                lastSubmittedRequest = editor.clone();
+                currentHttpService = service;
+            }
             sendBtn.setEnabled(false);
+            replayOriginalBtn.setEnabled(false);
             sendBtn.setText("Sending...");
-        }
-        if (cancelBtn != null) {
             cancelBtn.setEnabled(true);
+            statusLabel.setText(I18n.t("status.sending"));
+            responseContextLabel.setText(I18n.t("manual.response.waiting", targetText(service), wire.length,
+                    run.raw ? "Raw" : "Burp"));
+            responseContextLabel.setToolTipText(responseContextLabel.getText());
+            run.thread = new Thread(() -> executeSend(run), "BypassPro-Manual");
+            run.thread.setDaemon(true);
+            run.thread.start();
+        } catch (Exception e) {
+            activeSend = null;
+            restoreSendControls();
+            statusLabel.setText("Error: " + e.getMessage());
         }
+    }
 
-        // 决定 sender
-        byte[] preview = buildRequestBytesForSending(rawReq);
-        final boolean useRaw = shouldUseRawSocket(preview);
-        final String hostFinal = host;
-        final int portFinal = port;
-        final boolean httpsFinal = "https".equalsIgnoreCase(protocol);
-
-        if (useRaw) {
-            sendThread = new Thread(() -> sendViaRawSocket(
-                    rawReq, hostFinal, portFinal, httpsFinal, startNs));
-            sendThread.start();
-            return;
-        }
-
-        sendThread = new Thread(() -> {
-            try {
-                byte[] finalBytes = buildRequestBytesForSending(rawReq);
-                IHttpService currentTarget = targetService;
-                IHttpRequestResponse resp = null;
-                byte[] respBytes = null;
-                int redirectCount = 0;
-                final int MAX_REDIRECTS = Utils.getConfigMaxRedirects(3);
-
-                // 发送请求（可能跟随重定向）
-                while (!isCancelled) {
-                    resp = Utils.callbacks.makeHttpRequest(currentTarget, finalBytes);
-                    if (isCancelled)
+    private void executeSend(SendRun run) {
+        byte[] sent = run.wireBytes;
+        byte[] response = new byte[0];
+        byte[] firstResponse = new byte[0];
+        String detail = "";
+        StringBuilder chain = new StringBuilder();
+        int redirects = 0;
+        HttpResponse.Analysis received = null;
+        try {
+            if (!isCurrent(run)) return;
+            if (run.raw) {
+                RawSocketSender.RawResponse raw = new RawSocketSender().send(run.service.getHost(), run.service.getPort(),
+                        "https".equalsIgnoreCase(run.service.getProtocol()), sent, 5000, 5000);
+                sent = raw.getRequestBytesActuallySent();
+                response = raw.getResponseBytes();
+                firstResponse = response == null ? new byte[0] : response.clone();
+                received = raw.getAnalysis();
+                if (response == null || response.length == 0) detail = I18n.t("manual.no_response");
+            } else {
+                java.util.Set<String> visited = new java.util.HashSet<>();
+                visited.add(RedirectPolicy.requestUrl(run.service, sent).toString());
+                while (isCurrent(run)) {
+                    IHttpRequestResponse rr = Utils.callbacks.makeHttpRequest(run.service, sent);
+                    if (!isCurrent(run)) return;
+                    response = rr == null ? null : rr.getResponse();
+                    if (redirects == 0) firstResponse = response == null ? new byte[0] : response.clone();
+                    if (response == null || response.length == 0) {
+                        detail = I18n.t("manual.no_response");
                         break;
-
-                    respBytes = (resp == null) ? null : resp.getResponse();
-                    if (respBytes == null)
-                        break;
-
-                    // 检查是否需要跟随重定向
-                    if (followRedirect) {
-                        short statusCode = Utils.helpers.analyzeResponse(respBytes).getStatusCode();
-                        if (statusCode == 301 || statusCode == 302 || statusCode == 303 || statusCode == 307
-                                || statusCode == 308) {
-                            if (redirectCount >= MAX_REDIRECTS) {
-                                break;
-                            }
-                            String location = getHeaderValue(respBytes, "Location");
-                            if (location != null && !location.isEmpty()) {
-                                try {
-                                    // 解析 Location
-                                    java.net.URL redirectUrl;
-                                    if (location.startsWith("http://") || location.startsWith("https://")) {
-                                        redirectUrl = new java.net.URL(location);
-                                    } else {
-                                        // 相对路径
-                                        String base = currentTarget.getProtocol() + "://" + currentTarget.getHost();
-                                        if ((currentTarget.getProtocol().equals("http")
-                                                && currentTarget.getPort() != 80) ||
-                                                (currentTarget.getProtocol().equals("https")
-                                                        && currentTarget.getPort() != 443)) {
-                                            base += ":" + currentTarget.getPort();
-                                        }
-                                        if (!location.startsWith("/")) {
-                                            location = "/" + location;
-                                        }
-                                        redirectUrl = new java.net.URL(base + location);
-                                    }
-
-                                    // 构建新请求
-                                    String newProtocol = redirectUrl.getProtocol();
-                                    String newHost = redirectUrl.getHost();
-                                    int newPort = redirectUrl.getPort();
-                                    if (newPort == -1) {
-                                        newPort = "https".equals(newProtocol) ? 443 : 80;
-                                    }
-                                    String newPath = redirectUrl.getPath();
-                                    if (newPath == null || newPath.isEmpty())
-                                        newPath = "/";
-                                    if (redirectUrl.getQuery() != null) {
-                                        newPath += "?" + redirectUrl.getQuery();
-                                    }
-
-                                    currentTarget = Utils.helpers.buildHttpService(newHost, newPort, newProtocol);
-
-                                    // 303 强制 GET，其他保持方法
-                                    String method = (statusCode == 303) ? "GET"
-                                            : Utils.helpers.analyzeRequest(finalBytes).getMethod();
-                                    List<String> newHeaders = new ArrayList<>();
-                                    newHeaders.add(method + " " + newPath + " HTTP/1.1");
-                                    newHeaders.add("Host: " + newHost
-                                            + (newPort != 80 && newPort != 443 ? ":" + newPort : ""));
-
-                                    // 复制原有 headers（除了 Host）
-                                    List<String> oldHeaders = Utils.helpers.analyzeRequest(finalBytes).getHeaders();
-                                    for (int i = 1; i < oldHeaders.size(); i++) {
-                                        String h = oldHeaders.get(i);
-                                        if (!h.toLowerCase().startsWith("host:")
-                                                && !h.toLowerCase().startsWith("content-length:")) {
-                                            newHeaders.add(h);
-                                        }
-                                    }
-
-                                    // 303 不带 body
-                                    byte[] body = (statusCode == 303) ? new byte[0]
-                                            : Arrays.copyOfRange(finalBytes,
-                                                    Utils.helpers.analyzeRequest(finalBytes).getBodyOffset(),
-                                                    finalBytes.length);
-
-                                    finalBytes = Utils.helpers.buildHttpMessage(newHeaders, body);
-                                    redirectCount++;
-                                    continue;
-                                } catch (Exception e) {
-                                    break; // 解析失败，停止重定向
-                                }
-                            }
-                        }
                     }
-                    break; // 不是重定向或不跟随，退出循环
-                }
-
-                if (isCancelled)
-                    return;
-
-                final byte[] finalRespBytes = respBytes;
-                final byte[] finalReqBytes = finalBytes;
-                final IHttpRequestResponse finalResp = resp;
-                final int finalRedirectCount = redirectCount;
-                long durationMs = (System.nanoTime() - startNs) / 1_000_000L;
-
-                SwingUtilities.invokeLater(() -> {
-                    if (finalRespBytes == null) {
-                        currentResponseBytes = new byte[0];
-                        responseViewer.setMessage(new byte[0], false);
-                    } else {
-                        currentResponseBytes = finalRespBytes;
-                        responseViewer.setMessage(finalRespBytes, false);
-                    }
-
-                    HistoryEntry e = new HistoryEntry();
-                    e.id = (++historySeq);
-                    e.time = LocalDateTime.now().format(DateTimeFormatter.ofPattern("HH:mm:ss"));
-                    e.durationMs = durationMs;
-                    e.requestBytes = finalReqBytes;
-                    e.responseBytes = finalRespBytes == null ? new byte[0] : finalRespBytes;
-                    if (finalRespBytes != null) {
-                        e.status = Utils.helpers.analyzeResponse(finalRespBytes).getStatusCode();
-                        e.length = finalRespBytes.length;
-                    } else {
-                        e.status = 0;
-                        e.length = 0;
-                    }
-                    e.requestResponse = finalResp;
+                    int code = responseStatus(response);
+                    chain.append(code).append(" ").append(RedirectPolicy.requestUrl(run.service, sent)).append("\n");
+                    if (!run.followRedirect || !RedirectPolicy.isRedirect(code)) break;
+                    String location = getHeaderValue(response, "Location");
+                    if (location == null || location.isEmpty()) break;
+                    if (redirects >= run.maxRedirects) { detail = I18n.t("redirect.limit"); break; }
                     try {
-                        IRequestInfo reqInfo = Utils.helpers.analyzeRequest(finalReqBytes);
-                        e.method = reqInfo.getMethod();
-                        java.net.URL url = reqInfo.getUrl();
-                        if (url != null) {
-                            e.path = url.getPath();
-                            if (url.getQuery() != null && !url.getQuery().isEmpty()) {
-                                e.path += "?" + url.getQuery();
-                            }
-                        }
-                    } catch (Exception ignored) {
+                        java.net.URL next = RedirectPolicy.resolve(run.service, sent, location);
+                        if (!visited.add(next.toString())) { detail = I18n.t("redirect.loop"); break; }
+                        sent = RedirectPolicy.followRequest(sent, next, code);
+                        redirects++;
+                    } catch (Exception e) {
+                        detail = I18n.t("redirect.stopped", e.getMessage());
+                        break;
                     }
-
-                    addHistoryEntry(e);
-
-                    if (finalResp != null) {
-                        addToDataboard(finalResp);
-                    }
-
-                    if (statusLabel != null) {
-                        String statusText;
-                        if (finalRespBytes != null) {
-                            statusText = String.format(
-                                    "Status: %d | Time: %dms | Req: %s | Resp: %s%s",
-                                    e.status,
-                                    durationMs,
-                                    formatSize(finalReqBytes.length),
-                                    formatSize(finalRespBytes.length),
-                                    finalRedirectCount > 0 ? " | Redirects: " + finalRedirectCount : "");
-                        } else {
-                            statusText = String.format(
-                                    "Status: (none) | Time: %dms | Req: %s | Resp: 0B",
-                                    durationMs,
-                                    formatSize(finalReqBytes.length));
-                        }
-                        statusLabel.setText(statusText);
-                    }
-                });
-            } catch (Exception ex) {
-                if (isCancelled)
-                    return;
-                long durationMs = (System.nanoTime() - startNs) / 1_000_000L;
-                SwingUtilities.invokeLater(() -> {
-                    responseViewer.setMessage(("Error: " + ex.getMessage()).getBytes(StandardCharsets.UTF_8), false);
-                    if (statusLabel != null) {
-                        statusLabel.setText("Error | Time: " + durationMs + "ms");
-                    }
-                });
-            } finally {
-                sendThread = null;
-                SwingUtilities.invokeLater(() -> {
-                    if (sendBtn != null) {
-                        sendBtn.setEnabled(true);
-                        setSenderMode(senderMode);
-                    }
-                    if (cancelBtn != null) {
-                        cancelBtn.setEnabled(false);
-                    }
-                });
+                }
             }
-        });
-        sendThread.start();
-    }
-
-    /**
-     * 通过 RawSocketSender 发送原始字节，绕开 Burp 的客户端规范化。
-     * Ghost Bits 漏洞复现的标准路径。失败时同样把 sent bytes 写入 History 供 diff。
-     */
-    private void sendViaRawSocket(byte[] rawReq, String host, int port, boolean https, long startNs) {
-        byte[] finalBytes;
-        try {
-            finalBytes = buildRequestBytesForSending(rawReq);
-        } catch (Exception buildErr) {
-            handleRawFailure(rawReq, host, port, https, startNs, buildErr,
-                    "build request bytes failed");
-            return;
-        }
-        if (isCancelled)
-            return;
-
-        try {
-            RawSocketSender sender = new RawSocketSender();
-            RawSocketSender.RawResponse rr = sender.send(host, port, https, finalBytes, 5000, 5000);
-
-            if (isCancelled)
-                return;
-            final byte[] respBytes = rr.getResponseBytes();
-            final byte[] sentBytes = rr.getRequestBytesActuallySent();
-            final long durationMs = (System.nanoTime() - startNs) / 1_000_000L;
-            final int statusCode = rr.getStatusCode();
-
-            SwingUtilities.invokeLater(() -> {
-                if (respBytes == null || respBytes.length == 0) {
-                    currentResponseBytes = new byte[0];
-                    responseViewer.setMessage(new byte[0], false);
-                } else {
-                    currentResponseBytes = respBytes;
-                    responseViewer.setMessage(respBytes, false);
-                }
-
-                HistoryEntry e = newRawHistoryEntry(sentBytes, respBytes, durationMs,
-                        (short) statusCode, respBytes == null ? 0 : respBytes.length);
-                addHistoryEntry(e);
-
-                if (statusLabel != null) {
-                    String statusText = String.format(
-                            "[Raw] Status: %d | Time: %dms | Req: %s | Resp: %s",
-                            statusCode,
-                            durationMs,
-                            formatSize(sentBytes.length),
-                            formatSize(respBytes == null ? 0 : respBytes.length));
-                    statusLabel.setText(statusText);
-                }
-            });
         } catch (Exception ex) {
-            if (isCancelled)
-                return;
-            handleRawFailure(finalBytes, host, port, https, startNs, ex, null);
-        } finally {
-            sendThread = null;
-            SwingUtilities.invokeLater(() -> {
-                if (sendBtn != null) {
-                    sendBtn.setEnabled(true);
-                    setSenderMode(senderMode);
-                }
-                if (cancelBtn != null) {
-                    cancelBtn.setEnabled(false);
-                }
-            });
+            response = new byte[0];
+            detail = "Error: " + (ex.getMessage() == null ? ex.getClass().getSimpleName() : ex.getMessage());
         }
-    }
-
-    /**
-     * Raw 发送失败的统一处理：把已经准备好的 sent bytes 也写进 History，方便用户对比 wire bytes。
-     * Ghost Bits 调试最痛的就是失败时看不到发了啥，所以这里必须保留。
-     */
-    private void handleRawFailure(byte[] sentBytes, String host, int port, boolean https,
-            long startNs, Throwable ex, String prefix) {
-        long durationMs = (System.nanoTime() - startNs) / 1_000_000L;
-        final String msg = ex.getMessage() == null ? ex.getClass().getSimpleName() : ex.getMessage();
-        final String displayMsg = prefix == null || prefix.isEmpty() ? msg : prefix + ": " + msg;
-        final byte[] safeSent = sentBytes == null ? new byte[0] : sentBytes;
-        final long durMs = durationMs;
-        final String target = (https ? "https://" : "http://") + host + ":" + port;
-
-        // 失败响应 body 同时包含人类可读错误 + 实际发送字节的 hex 摘要，便于 History 单击查看
-        StringBuilder body = new StringBuilder();
-        body.append("Raw Socket Error: ").append(displayMsg).append('\n');
-        body.append("Target: ").append(target).append('\n');
-        body.append("Sent bytes: ").append(safeSent.length).append('\n');
-        body.append("Hex (first 256): ").append(toHexShort(safeSent, 256)).append('\n');
-        byte[] respPlaceholder = ("HTTP/1.1 0 Raw Socket Error\r\n"
-                + "Content-Type: text/plain; charset=utf-8\r\n\r\n" + body).getBytes(StandardCharsets.UTF_8);
-
+        final byte[] finalSent = sent.clone();
+        final byte[] finalResponse = response == null ? new byte[0] : response.clone();
+        if (received == null) received = HttpResponse.analyze(finalResponse, firstLine(finalSent).split(" ", 2)[0]);
+        if (!received.complete && finalResponse.length > 0) detail += " | " + received.issue;
+        final short finalStatus = (short)received.statusCode;
+        final HttpResponse.Analysis finalAnalysis = received;
+        final String comparison = run.baseline
+                ? (received.complete ? "" : I18n.t("baseline.failed") + " | ")
+                    + BypassMain.baselineSummary(run.reference, run.referenceIsReplay ? received
+                        : HttpResponse.analyze(firstResponse, firstLine(run.wireBytes).split(" ", 2)[0]))
+                : run.reference != null ? I18n.t("baseline.compare", BypassMain.responseMetrics(run.reference, received))
+                    : I18n.t(baselineRun == null ? "baseline.not_checked" : "baseline.conditions_changed");
+        final String finalDetail = detail;
+        final String finalChain = chain.toString();
+        final int finalRedirects = redirects;
         SwingUtilities.invokeLater(() -> {
-            responseViewer.setMessage(respPlaceholder, false);
-
-            HistoryEntry e = newRawHistoryEntry(safeSent, respPlaceholder, durMs, (short) 0,
-                    respPlaceholder.length);
-            addHistoryEntry(e);
-
-            if (statusLabel != null) {
-                statusLabel.setText("[Raw] Error | Time: " + durMs + "ms | " + displayMsg);
+            if (!isCurrent(run)) return;
+            try {
+                if (run.baseline) {
+                    baselineResponseBytes = finalResponse;
+                    baselineDisplayedRequestBytes = finalSent;
+                    baselineHttpService = run.service;
+                    baselineRun = finalAnalysis.complete ? run : null;
+                    baselineCheckText = comparison + (finalRedirects > 0
+                            ? " | " + I18n.t("baseline.final", finalStatus, finalResponse.length) : "");
+                    currentComparisonText = currentResponseBytes.length == 0 ? ""
+                            : I18n.t(finalAnalysis.complete ? "baseline.updated" : "baseline.not_checked");
+                    responseChoice.setSelectedIndex(1);
+                } else {
+                    currentResponseBytes = finalResponse;
+                    currentDisplayedRequestBytes = finalSent;
+                    responseRequestBytes = run.editorBytes.clone();
+                    currentComparisonText = comparison;
+                    currentResponseSteps = I18n.t("manual.steps", run.steps);
+                    responseChoice.setSelectedIndex(0);
+                }
+                HistoryEntry entry = new HistoryEntry();
+                entry.id = ++historySeq;
+                entry.time = LocalDateTime.now().format(DateTimeFormatter.ofPattern("HH:mm:ss"));
+                entry.durationMs = (System.nanoTime() - run.startNs) / 1000000L;
+                entry.requestBytes = finalSent;
+                entry.responseBytes = finalResponse;
+                entry.service = run.service;
+                entry.sender = run.raw ? "Raw" : "Burp";
+                entry.length = finalResponse.length;
+                entry.detail = (run.baseline ? I18n.t("manual.replay_original") : I18n.t("manual.steps", run.steps))
+                        + " | " + comparison + (finalDetail.isEmpty() ? "" : " | " + finalDetail);
+                entry.status = finalStatus;
+                String[] first = firstLine(finalSent).split(" ", 3);
+                entry.method = first.length > 0 ? first[0] : "";
+                entry.path = first.length > 1 ? first[1] : "";
+                entry.requestResponse = new BypassMain.SimpleHttpRequestResponse(run.service, finalSent, finalResponse);
+                addHistoryEntry(entry);
+                if (!run.baseline && !run.raw && finalResponse.length > 0) addToDataboard(entry.requestResponse, entry.detail);
+                statusLabel.setText(String.format("[%s] Status: %d | %dms | Req: %dB | Resp: %dB | Redirects: %d %s",
+                        entry.sender, entry.status, entry.durationMs, finalSent.length, finalResponse.length, finalRedirects, finalDetail));
+                showSelectedResponse();
+                responseContextLabel.setToolTipText(responseContextLabel.getToolTipText() + " | " + targetText(run.service)
+                        + " | " + finalChain + entry.detail);
+            } finally {
+                activeSend = null;
+                restoreSendControls();
             }
         });
     }
 
-    private HistoryEntry newRawHistoryEntry(byte[] sentBytes, byte[] respBytes,
-            long durationMs, short statusCode, int respLen) {
-        HistoryEntry e = new HistoryEntry();
-        e.id = (++historySeq);
-        e.time = LocalDateTime.now().format(DateTimeFormatter.ofPattern("HH:mm:ss"));
-        e.durationMs = durationMs;
-        e.requestBytes = sentBytes;
-        e.responseBytes = respBytes == null ? new byte[0] : respBytes;
-        e.status = statusCode;
-        e.length = respLen;
-        e.sender = "Raw";
-        e.requestResponse = null;
-
-        try {
-            int len = Math.min(sentBytes.length, 256);
-            String head = new String(sentBytes, 0, len, StandardCharsets.UTF_8);
-            int firstSpace = head.indexOf(' ');
-            int secondSpace = head.indexOf(' ', firstSpace + 1);
-            if (firstSpace > 0 && secondSpace > firstSpace) {
-                e.method = head.substring(0, firstSpace);
-                e.path = head.substring(firstSpace + 1, secondSpace);
-            }
-        } catch (Exception ignored) {
-        }
-        return e;
+    private short responseStatus(byte[] response) {
+        if (response == null || response.length == 0) return 0;
+        return (short)HttpResponse.analyze(response, "").statusCode;
     }
 
-    private static String toHexShort(byte[] bytes, int max) {
-        if (bytes == null || bytes.length == 0)
-            return "";
-        int len = Math.min(bytes.length, max);
-        StringBuilder sb = new StringBuilder(len * 3);
-        for (int i = 0; i < len; i++) {
-            if (i > 0)
-                sb.append(' ');
-            sb.append(String.format("%02x", bytes[i] & 0xFF));
-        }
-        if (bytes.length > max)
-            sb.append(" …(+").append(bytes.length - max).append(" bytes)");
-        return sb.toString();
+    private static String targetText(IHttpService service) {
+        return service == null ? "?" : service.getProtocol() + "://" + service.getHost() + ":" + service.getPort();
     }
 
     private String getHeaderValue(byte[] response, String headerName) {
-        if (response == null)
-            return null;
-        try {
-            IResponseInfo info = Utils.helpers.analyzeResponse(response);
-            for (String h : info.getHeaders()) {
-                if (h.toLowerCase().startsWith(headerName.toLowerCase() + ":")) {
-                    return h.substring(headerName.length() + 1).trim();
-                }
-            }
-        } catch (Exception ignored) {
-        }
-        return null;
+        return response == null ? null : HttpResponse.analyze(response, "").header(headerName);
     }
 
     private String formatSize(int size) {
@@ -4653,24 +4428,29 @@ public class ManualWafPanel extends JPanel implements IMessageEditorController {
         historyModel.fireTableDataChanged();
     }
 
-    private void addToDataboard(IHttpRequestResponse response) {
+    private void addToDataboard(IHttpRequestResponse response, String detail) {
         try {
             byte[] respBytes = response.getResponse();
             if (respBytes == null)
                 return;
-            short statusCode = Utils.helpers.analyzeResponse(respBytes).getStatusCode();
-            String title = Utils.getBodyTitle(new String(respBytes, StandardCharsets.UTF_8));
+            String method = Utils.helpers.analyzeRequest(response).getMethod();
+            HttpResponse.Analysis analysis = HttpResponse.analyze(respBytes, method);
+            short statusCode = (short)analysis.statusCode;
+            HttpResponse.Text decoded = analysis.decodeText();
+            String title = Utils.getBodyTitle(decoded.value == null ? "" : decoded.value);
             String reason = String.format("manual send; status:%d", statusCode);
+            if (!detail.isEmpty()) reason += "; " + detail;
+            if (!decoded.issue.isEmpty()) reason += "; " + decoded.issue;
             Utils.panel.getBypassTableModel().addBypass(new Bypass(
                     DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss").format(LocalDateTime.now()),
-                    Utils.helpers.analyzeRequest(response).getMethod(),
+                    method,
                     String.valueOf(respBytes.length),
                     Utils.callbacks.saveBuffersToTempFiles(response),
                     Utils.helpers.analyzeRequest(response).getUrl(),
                     statusCode,
-                    Utils.helpers.analyzeResponse(respBytes).getStatedMimeType(),
+                    analysis.header("Content-Type"),
                     title,
-                    Utils.count++,
+                    BypassMain.nextId(),
                     "manual waf",
                     reason));
         } catch (Exception ignored) {
@@ -4678,20 +4458,24 @@ public class ManualWafPanel extends JPanel implements IMessageEditorController {
     }
 
     private void showHistoryEntry(int index) {
-        if (index < 0 || index >= historyEntries.size())
-            return;
-        byte[] resp = historyEntries.get(index).responseBytes;
-        if (resp == null)
-            resp = new byte[0];
-        currentResponseBytes = resp;
-        responseViewer.setMessage(resp, false);
+        if (index < 0 || index >= historyEntries.size()) return;
+        HistoryEntry entry = historyEntries.get(index);
+        statusLabel.setText(I18n.t("manual.history.selected", entry.id, targetText(entry.service))
+                + (entry.detail == null || entry.detail.isEmpty() ? "" : " | " + entry.detail));
     }
 
     // --- Public API ---
     public void loadRequest(IHttpRequestResponse requestResponse) {
         if (requestResponse == null)
             return;
+        cancelRequest();
         currentHttpService = requestResponse.getHttpService();
+        originalHttpService = currentHttpService;
+        baselineHttpService = currentHttpService;
+        baselineRun = null;
+        baselineCheckText = I18n.t("baseline.not_checked");
+        currentComparisonText = "";
+        currentResponseSteps = "";
         if (currentHttpService != null) {
             if (hostField != null)
                 hostField.setText(currentHttpService.getHost());
@@ -4701,10 +4485,16 @@ public class ManualWafPanel extends JPanel implements IMessageEditorController {
                 httpsCheckBox.setSelected("https".equalsIgnoreCase(currentHttpService.getProtocol()));
         }
 
-        byte[] req = requestResponse.getRequest();
-        if (req != null) {
-            requestViewer.setMessage(req, true);
+        byte[] req = requestResponse.getRequest() == null ? new byte[0] : requestResponse.getRequest();
+        {
+            requestViewer.setMessage(req.clone(), true);
             originalRequest = Arrays.copyOf(req, req.length);
+            baselineDisplayedRequestBytes = req.clone();
+            currentDisplayedRequestBytes = req.clone();
+            transformations.clear();
+            transformationBytes = req.clone();
+            responseRequestBytes = req.clone();
+            lastSubmittedRequest = new byte[0];
             undoStack.clear();
             redoStack.clear();
             updateUndoRedoButtons();
@@ -4712,12 +4502,19 @@ public class ManualWafPanel extends JPanel implements IMessageEditorController {
 
         byte[] resp = requestResponse.getResponse();
         if (resp != null) {
-            currentResponseBytes = resp;
-            responseViewer.setMessage(resp, false);
+            currentResponseBytes = resp.clone();
+            responseViewer.setMessage(currentResponseBytes, false);
         } else {
             currentResponseBytes = new byte[0];
             responseViewer.setMessage(new byte[0], false);
         }
+        capturedResponseBytes = currentResponseBytes.clone();
+        baselineResponseBytes = currentResponseBytes.clone();
+        responseChoice.setSelectedIndex(0);
+        setSenderMode(SenderMode.AUTO);
+        statusLabel.setText(I18n.t("manual.loaded", firstLine(getRequestBytes())));
+        showSelectedResponse();
+        refreshRequestInspector();
     }
 
     // --- IMessageEditorController ---
@@ -4825,7 +4622,7 @@ public class ManualWafPanel extends JPanel implements IMessageEditorController {
         List<Integer> positions = findAllOccurrences(msg, target);
 
         if (positions.isEmpty()) {
-            JOptionPane.showMessageDialog(this, "未找到选中文本在请求中的位置", I18n.t("dialog.tip.title"),
+            JOptionPane.showMessageDialog(this, I18n.t("dialog.selection_not_found"), I18n.t("dialog.tip.title"),
                     JOptionPane.INFORMATION_MESSAGE);
             return null;
         }
@@ -4842,22 +4639,22 @@ public class ManualWafPanel extends JPanel implements IMessageEditorController {
         List<String> optionList = new ArrayList<>();
         String selectionOption = null;
         if (selectionIdx != null) {
-            selectionOption = "选区处";
+            selectionOption = I18n.t("dialog.scope.selection");
             optionList.add(selectionOption);
         }
-        String allOption = "全部 (" + positions.size() + " 处)";
+        String allOption = I18n.t("dialog.scope.all", positions.size());
         optionList.add(allOption);
         for (int i = 0; i < positions.size(); i++) {
             int pos = positions.get(i);
             String context = getContextSnippet(msg, pos, target.length, 20);
-            optionList.add("第 " + (i + 1) + " 处: ..." + context + "...");
+            optionList.add(I18n.t("dialog.scope.occurrence", i + 1, context));
         }
         String[] options = optionList.toArray(new String[0]);
 
         Object choice = JOptionPane.showInputDialog(
                 this,
-                "请求中有 " + positions.size() + " 处匹配，选择作用域：",
-                "作用域",
+                I18n.t("dialog.scope.prompt", positions.size()),
+                I18n.t("dialog.scope.title"),
                 JOptionPane.QUESTION_MESSAGE,
                 null,
                 options,
@@ -4893,7 +4690,7 @@ public class ManualWafPanel extends JPanel implements IMessageEditorController {
         if (bytesMatchAt(msg, scope.index, target)) {
             replaceAtIndex(msg, scope.index, target.length, replacement);
         } else {
-            JOptionPane.showMessageDialog(this, "选区位置已变化，未找到可替换内容", I18n.t("dialog.tip.title"),
+            JOptionPane.showMessageDialog(this, I18n.t("dialog.selection_changed"), I18n.t("dialog.tip.title"),
                     JOptionPane.INFORMATION_MESSAGE);
         }
     }
@@ -4947,19 +4744,19 @@ public class ManualWafPanel extends JPanel implements IMessageEditorController {
     }
 
     private void replaceAllOccurrences(byte[] msg, List<Integer> positions, int targetLen, byte[] replacement) {
-        // 从后往前替换，避免位置偏移
-        byte[] current = msg;
-        for (int i = positions.size() - 1; i >= 0; i--) {
-            int pos = positions.get(i);
-            byte[] out = new byte[current.length - targetLen + replacement.length];
-            System.arraycopy(current, 0, out, 0, pos);
-            System.arraycopy(replacement, 0, out, pos, replacement.length);
-            System.arraycopy(current, pos + targetLen, out, pos + replacement.length,
-                    current.length - (pos + targetLen));
-            current = out;
+        byte[] out = new byte[msg.length + positions.size() * (replacement.length - targetLen)];
+        int source = 0, dest = 0;
+        for (int pos : positions) {
+            int span = pos - source;
+            System.arraycopy(msg, source, out, dest, span);
+            dest += span;
+            System.arraycopy(replacement, 0, out, dest, replacement.length);
+            dest += replacement.length;
+            source = pos + targetLen;
         }
-        pendingRequestCaretPosition = current.length;
-        setRequestBytes(current);
+        System.arraycopy(msg, source, out, dest, msg.length - source);
+        pendingRequestCaretPosition = out.length;
+        setRequestBytes(out);
     }
 
     private List<Integer> findAllOccurrences(byte[] haystack, byte[] needle) {
@@ -5045,7 +4842,7 @@ public class ManualWafPanel extends JPanel implements IMessageEditorController {
     private void insertIntoSelectionOrWarn(byte[] insert, boolean beforeSelection) {
         byte[] sel = getSelectedRequestBytes();
         if (sel == null || sel.length == 0) {
-            JOptionPane.showMessageDialog(this, "请先选中插入位置", I18n.t("dialog.tip.title"),
+            JOptionPane.showMessageDialog(this, I18n.t("dialog.select_insertion"), I18n.t("dialog.tip.title"),
                     JOptionPane.INFORMATION_MESSAGE);
             return;
         }
@@ -5053,7 +4850,7 @@ public class ManualWafPanel extends JPanel implements IMessageEditorController {
         List<Integer> positions = findAllOccurrences(msg, sel);
 
         if (positions.isEmpty()) {
-            JOptionPane.showMessageDialog(this, "未找到选中文本在请求中的位置", I18n.t("dialog.tip.title"),
+            JOptionPane.showMessageDialog(this, I18n.t("dialog.selection_not_found"), I18n.t("dialog.tip.title"),
                     JOptionPane.INFORMATION_MESSAGE);
             return;
         }
@@ -5066,20 +4863,20 @@ public class ManualWafPanel extends JPanel implements IMessageEditorController {
             List<String> optionList = new ArrayList<>();
             String selectionOption = null;
             if (selectionIdx != null) {
-                selectionOption = "选区处";
+                selectionOption = I18n.t("dialog.scope.selection");
                 optionList.add(selectionOption);
             }
             for (int i = 0; i < positions.size(); i++) {
                 int pos = positions.get(i);
                 String context = getContextSnippet(msg, pos, sel.length, 20);
-                optionList.add("第 " + (i + 1) + " 处: ..." + context + "...");
+                optionList.add(I18n.t("dialog.scope.occurrence", i + 1, context));
             }
             String[] options = optionList.toArray(new String[0]);
 
             Object choice = JOptionPane.showInputDialog(
                     this,
-                    "请求中有 " + positions.size() + " 处匹配，选择作用域：",
-                    "作用域",
+                    I18n.t("dialog.scope.prompt", positions.size()),
+                    I18n.t("dialog.scope.title"),
                     JOptionPane.QUESTION_MESSAGE,
                     null,
                     options,
@@ -5137,33 +4934,14 @@ public class ManualWafPanel extends JPanel implements IMessageEditorController {
         headersStr = expandInlineTags(headersStr);
 
         String bodyStr = new String(split.bodyBytes, StandardCharsets.ISO_8859_1);
-        boolean binary = hasHeaderContains(headersStr, "Content-Encoding", "gzip") || looksBinaryBody(bodyStr);
-        byte[] bodyExpanded = buildBodyBytesWithTags(bodyStr,
-                binary ? StandardCharsets.ISO_8859_1 : StandardCharsets.UTF_8);
+        byte[] bodyExpanded = buildBodyBytesWithTags(bodyStr, StandardCharsets.ISO_8859_1);
 
-        if (tamperedCL) {
-            // 用户刻意篡改了 Content-Length：保留 Header 不动，只在 body 里展开 dirty/null 占位符
-            return concatRequest(headersStr.getBytes(StandardCharsets.ISO_8859_1), split.delimiterBytes, bodyExpanded);
+        // 只有占位符实际改变正文长度才更新普通报文的 CL；保留用户构造的 TE/CL 组合。
+        if (!tamperedCL && !hasHeaderName(headersStr, "Transfer-Encoding")
+                && bodyExpanded.length != split.bodyBytes.length) {
+            headersStr = upsertHeaderLine(headersStr, "Content-Length", String.valueOf(bodyExpanded.length), split.lineEnd);
         }
-
-        String lineEnd = split.lineEnd;
-        String newHeaders = headersStr;
-
-        boolean hasTE = hasHeaderName(newHeaders, "Transfer-Encoding");
-        boolean hasCL = hasHeaderName(newHeaders, "Content-Length");
-
-        if (hasCL) {
-            // 用户没篡改 CL，但 dirty 展开后长度变了：自动更新 CL；同时移除 TE，避免 CL-TE 冲突
-            newHeaders = removeHeaderLine(newHeaders, "Transfer-Encoding", lineEnd);
-            newHeaders = upsertHeaderLine(newHeaders, "Content-Length", String.valueOf(bodyExpanded.length), lineEnd);
-        } else if (!hasTE) {
-            // 没有 TE，也没有 CL：补齐 CL
-            newHeaders = upsertHeaderLine(newHeaders, "Content-Length", String.valueOf(bodyExpanded.length), lineEnd);
-        } else {
-            // 有 TE 且无 CL：按用户意图保留（不强行加 CL），只展开 body
-        }
-
-        return concatRequest(newHeaders.getBytes(StandardCharsets.ISO_8859_1), split.delimiterBytes, bodyExpanded);
+        return concatRequest(headersStr.getBytes(StandardCharsets.ISO_8859_1), split.delimiterBytes, bodyExpanded);
     }
 
     private boolean hasHeaderName(String headers, String headerName) {
@@ -5458,12 +5236,16 @@ public class ManualWafPanel extends JPanel implements IMessageEditorController {
         byte[] requestBytes;
         byte[] responseBytes;
         IHttpRequestResponse requestResponse;
+        IHttpService service;
+        String detail;
         /** "Burp" / "Raw"，用于区分发送通道 */
         String sender = "Burp";
     }
 
     class HistoryTableModel extends AbstractTableModel {
-        private final String[] columns = { "#", "Sender", "Method", "Path", "Status", "Length", "Time(ms)", "Clock" };
+        private final String[] columns = { "#", I18n.t("history.sender"), I18n.t("history.method"), I18n.t("history.path"),
+                I18n.t("history.status"), I18n.t("history.length"), I18n.t("history.duration"),
+                I18n.t("history.clock"), I18n.t("history.target") };
 
         @Override
         public int getRowCount() {
@@ -5500,6 +5282,8 @@ public class ManualWafPanel extends JPanel implements IMessageEditorController {
                     return e.durationMs;
                 case 7:
                     return e.time;
+                case 8:
+                    return targetText(e.service);
                 default:
                     return "";
             }

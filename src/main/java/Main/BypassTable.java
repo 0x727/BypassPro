@@ -47,6 +47,12 @@ public class BypassTable extends JTable implements IMessageEditorController {
         setAutoResizeMode(JTable.AUTO_RESIZE_ALL_COLUMNS);
         configureColumns();
         setAutoCreateRowSorter(true);
+        getSelectionModel().addListSelectionListener(e -> {
+            if (!e.getValueIsAdjusting()) {
+                int selected = getSelectedRow();
+                display(selected < 0 ? null : bypassTableModel.getBypassAt(convertRowIndexToModel(selected)));
+            }
+        });
     }
 
     private void configureColumns() {
@@ -140,15 +146,17 @@ public class BypassTable extends JTable implements IMessageEditorController {
         return currentlyDisplayedItem.getHttpService();
     }
 
-    @Override
-    public void changeSelection(int row, int col, boolean toggle, boolean extend) {
-        Bypass bypassEntry = bypassTableModel.getBypassAt(convertRowIndexToModel(row));
-        if (bypassEntry != null) {
-            requestViewer.setMessage(bypassEntry.requestResponse.getRequest(), true);
-            responseViewer.setMessage(bypassEntry.requestResponse.getResponse(), false);
-            currentlyDisplayedItem = bypassEntry.requestResponse;
-        }
-        super.changeSelection(row, col, toggle, extend);
+    private void display(Bypass entry) {
+        currentlyDisplayedItem = entry == null ? null : entry.requestResponse;
+        requestViewer.setMessage(getRequest(), true);
+        responseViewer.setMessage(getResponse(), false);
+    }
+
+    void clearViewers() {
+        clearSelection();
+        currentlyDisplayedItem = null;
+        requestViewer.setMessage(new byte[0], true);
+        responseViewer.setMessage(new byte[0], false);
     }
 
     IMessageEditor getRequestViewer() {

@@ -31,21 +31,33 @@ import java.util.List;
 public class BypassTableModel extends AbstractTableModel {
 
     private final List<Bypass> bypassArray = new ArrayList<>();
+    private int discarded;
     private final Object lock = new Object();
 
     public void addBypass(Bypass b) {
-        synchronized (lock) {
-            bypassArray.add(b);
+        if (!javax.swing.SwingUtilities.isEventDispatchThread()) {
+            javax.swing.SwingUtilities.invokeLater(() -> addBypass(b));
+            return;
         }
-        javax.swing.SwingUtilities.invokeLater(this::fireTableDataChanged);
+        if (getRowCount() >= 5000) {
+            synchronized (lock) { bypassArray.remove(0); discarded++; }
+            fireTableRowsDeleted(0, 0);
+        }
+        int row;
+        synchronized (lock) { row = bypassArray.size(); bypassArray.add(b); }
+        fireTableRowsInserted(row, row);
     }
 
     public void clearAll() {
-        synchronized (lock) {
-            bypassArray.clear();
+        if (!javax.swing.SwingUtilities.isEventDispatchThread()) {
+            javax.swing.SwingUtilities.invokeLater(this::clearAll);
+            return;
         }
-        javax.swing.SwingUtilities.invokeLater(this::fireTableDataChanged);
+        synchronized (lock) { bypassArray.clear(); discarded = 0; }
+        fireTableDataChanged();
     }
+
+    int getDiscardedCount() { synchronized (lock) { return discarded; } }
 
     public int getRowCount() {
         synchronized (lock) {
@@ -135,7 +147,7 @@ public class BypassTableModel extends AbstractTableModel {
             case 4:
                 return bypassEntry.length;
             case 5:
-                return bypassEntry.url.toString();
+                return bypassEntry.url == null ? "" : bypassEntry.url.toString();
             case 6:
                 return bypassEntry.mimeType;
             case 7:

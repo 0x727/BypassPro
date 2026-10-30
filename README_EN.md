@@ -19,7 +19,7 @@ This project is a second development based on [p0desta/AutoBypass403-BurpSuite](
 - [Quick Start](#quick-start)
 - [Which Entry Should I Use?](#which-entry-should-i-use)
 - [Cases Only](#cases)
-- [BypassPro 5.1 Highlights](#bypasspro-51-highlights)
+- [BypassPro 5.2 Highlights](#bypasspro-52-highlights)
   - [Modes](#modes)
   - [Manual WAF Workbench](#manual-waf-workbench)
   - [Gh0st Bits](#gh0st-bits)
@@ -30,9 +30,9 @@ This project is a second development based on [p0desta/AutoBypass403-BurpSuite](
 - [Auto WAF Bypass](#auto-waf-bypass)
 - [Manual WAF](#manual-waf)
 
-### BypassPro 5.1 Highlights
+### BypassPro 5.2 Highlights
 
-BypassPro 5.1 turns the old single-purpose 403 bypass workflow into a combined Burp extension with:
+BypassPro 5.2 improves request baselines, response comparison, task control, configuration saving and layout across the existing 5.x workbench, which includes:
 
 - automated access-control bypass checks,
 - automated WAF bypass mutation,
@@ -42,6 +42,10 @@ BypassPro 5.1 turns the old single-purpose 403 bypass workflow into a combined B
 - YAML-based configuration.
 
 #### Modes
+
+Version 5.2 adds original-request baseline replays, manual baseline response switching and transformation sequences, and improves response comparison, charset handling and body conversion. Dashboard controls sit on the left and counters on the right, with automatic wrapping in narrow windows and a separate right-aligned status line.
+
+Manual WAF separates network targets from action buttons, aligns the request and response editors, and places baseline details below them. History shows status, method and path first; other columns scroll horizontally. Collapsing History frees space for the tools.
 
 **Auto Access Bypass**
 
@@ -69,9 +73,9 @@ BypassPro 5.1 turns the old single-purpose 403 bypass workflow into a combined B
 - Features:
   - Burp native `IMessageEditor` with Pretty / Raw / Hex support,
   - editable host / port / HTTPS target,
-  - Send / Cancel / Reset / Undo / Redo,
-  - Follow Redirect, using `general.max_redirects` as the global hop limit,
-  - request/response History.
+  - Send / Cancel / Replay Original / Restore Original / Undo / Redo,
+  - same-origin Follow Redirect (same host, port and protocol) for Burp sending; Raw mode disables it, using `general.max_redirects` as the global hop limit,
+  - collapsible History containing request, response, network target and sender mode; double-click to load the full snapshot.
 
 #### Manual WAF Workbench
 
@@ -88,9 +92,16 @@ Selection rules:
 
 - If text is selected, the selected range has highest priority.
 - If the same selected bytes appear multiple times, BypassPro asks for scope: selected occurrence / all / Nth occurrence.
-- For URL encoding operations where safe characters do not change by default, BypassPro asks for scope first, then asks whether to force every UTF-8 byte into `%XX`.
+- URL / Base64 operate on the selected bytes. Text mutations use the declared body charset and retain the request if conversion fails.
+- For URL encoding operations where safe characters do not change by default, BypassPro asks for scope first, then asks whether to force every selected byte into `%XX`.
 - If no safe scope can be inferred, it asks the user to select text first.
 - After mutation, the editor keeps the caret/selection near the changed position.
+
+Whole-body conversion and automatic body mutations skip transfer-encoded or compressed bodies. Response comparison uses the final status and decoded entity after chunk framing, gzip / deflate, and charset decoding. Truncated or undecodable responses retain the original bytes and a diagnostic.
+
+Body conversion leaves existing JSON unchanged. Converting nested JSON or file parts to text parameters reports the unsupported conversion and retains the request. Ghost body mutations use the declared charset and skip candidates it cannot represent.
+
+Send preparation preserves TE/CL combinations and updates CL only when placeholder expansion changes an ordinary body's length. Response comparison preserves whitespace inside JSON strings and samples normalized long bodies across the full content, comparing at most 8000 characters.
 
 #### Gh0st Bits
 
@@ -103,6 +114,8 @@ Common manual capabilities:
 - Candidate lookup: select a single ASCII character and inspect possible Ghost characters.
 - Common payload helpers: `.%u002e`, CRLF, `.jsp`, `@type`, `class`.
 - Parser helpers: fastjson `\x4_`, fastjson `\u`, jackson `\u`, Unicode digits, Jetty `%2>`, Fullwidth URL, Tomcat `%HH`.
+
+Parser previews model the selected decoding mechanism locally; they do not establish the target parser or an affected version.
 
 Important clarification: Gh0st Bits is not a fixed payload and is not equivalent to "Chinese characters mean vulnerability". The characters are only a visual representation of bytes that may be restored differently by downstream components.
 
@@ -143,7 +156,7 @@ Notes:
 - First startup copies the built-in template to the external config path.
 - Config UI supports Reload / Reinit / Save General / Save WAF Options.
 - `general.max_redirects` is shared by Dashboard automatic mode and Manual WAF Follow Redirect. Default: `3`.
-- `general.lang` supports `zh` and `en`.
+- `general.lang` supports `zh` and `en`. Select the language in Config → General, save, then reload the extension. Menus, tooltips, operation dialogs and built-in template descriptions follow the selected language. Request data, custom templates and raw YAML retain their original text.
 
 #### Dashboard and Results
 
@@ -151,10 +164,18 @@ Dashboard controls:
 
 - `AutoScan`: listen to Proxy responses and automatically scan 401/403 responses.
 - `Follow Redirect`: control whether Dashboard automatic/send tasks follow `301/302/303/307/308`. Default: off.
-- `Threads`: current scan concurrency from `general.threads`.
-- `Req`, progress bar, `Err`, and `Clear`.
+- `Threads`: Dashboard global concurrency limit from `general.threads`; changes apply to new inputs after the current queue drains. Manual WAF sends separately.
+- `Planned`, `Done`, `Err`, `Active`, `Cancelled`, and actual completion percentage. All failed requests still complete the run.
+- Uncheck `AutoScan` to stop accepting new traffic while queued work continues.
+- `Stop` disables listening, cancels queued work and ignores late results; active transports may still finish.
+- `Clear` stops the run and clears results, viewers and counters.
+- Switch between Signals + errors / All results / Errors / Filtered / Baselines, and search URL or reason. The latest 5000 rows are retained, with a visible count of older rows removed. A full input queue is reported instead of silently accepting more work.
 
-Follow Redirect is snapshotted when a task starts. Changing the checkbox later only affects new AutoScan / Send tasks.
+Each original is replayed once before independent variants are generated. Variants compare against that replay; Reason shows baseline changes, modified regions, status, length and similarity. Failed baseline sends skip that original’s variants; changed baselines require review. Baselines has the original replay records, and replays count toward progress. One replay does not prove ongoing stability. Raw variants flag their different transport conditions.
+
+In Manual WAF, use Replay Original → Restore Original → one transformation → Send → compare. Replay preserves editor changes. Switch between Baseline response and Current response; differing targets, senders or redirect settings require a new replay. The transformation sequence follows Undo, Redo and Restore; related header and length updates belong to the same operation.
+
+Follow Redirect is snapshotted when variants are prepared. Changes affect subsequently prepared tasks. Only same-origin redirects are followed; Raw Ghost variants report that redirects are unsupported. Hover over the Redirect column for the chain and stop reason.
 
 Dashboard columns:
 
@@ -205,6 +226,14 @@ Triggers:
 - Dashboard `AutoScan`.
 - Context menu `Send to BypassPro (Access Control)`.
 
+AutoScan conditions:
+
+- Enable `AutoScan` in Dashboard; it is off by default.
+- Only new Proxy responses with status `401` or `403` trigger scans. Existing history is not rescanned; use the context menu for requests from Repeater or other tools.
+- Static resources are excluded using `profiles.auto_access_bypass.ignore_extensions`.
+
+AutoScan listens to Proxy traffic and actively sends request variants. If Dashboard has no rows, check whether `Planned` increases: an increase means scan tasks were generated. The default view shows Signals + errors; switch to All results or Filtered to inspect other completed variants.
+
 Rules:
 
 - `suffix`: append variants to the path.
@@ -212,7 +241,7 @@ Rules:
 - `boundary_insert`: insert tokens at directory boundaries.
 - `headers`: add or replace spoofing headers.
 
-Dashboard records candidates when response status/body differences meet the configured threshold. `Reason` may show:
+Dashboard candidate statuses are `200/206/304/301/302/303/307/308/405/415`, combined with body similarity below `general.similarity_threshold` or a status-code class change; Ghost variants also check configured signatures. All completed variants are recorded: non-signals are marked Filtered, and failed requests appear as Errors. `405/415` indicate parser or method clues, not confirmed bypasses. `Reason` may show:
 
 ```text
 status:403 -> 200
@@ -257,7 +286,10 @@ Basic workflow:
 3. Use a tool button in the lower tool area.
 4. Inspect status, Ghost restore preview, and response diff hints.
 5. Choose send mode: `Auto`, `Burp`, or `Raw`.
-6. Click `Send`; results appear in the response viewer and History.
+6. Confirm Network Host / Port / HTTPS and click `Send`. Each send takes an independent snapshot; editing afterwards labels the response as belonging to the previously sent version.
+7. `Cancel` stops waiting and ignores late results; the transport may still finish. Double-click History to restore request, response, network destination and sender mode. Single-click only selects the entry. Loading a new request prompts before replacing unsent edits.
+
+Selection-only tools are disabled until text is selected. The status area shows selected byte count, mutation size changes and Undo feedback; equal-length body changes are also detected.
 
 ### Quick Start
 

@@ -38,10 +38,11 @@ public class Utils {
     static MainPanel panel;
     public static long count = 0;
     // Auto Scan 开关
-    public static boolean isProxySelected = false;
+    public static volatile boolean isProxySelected = false;
     public static Map<String, Object> configMap = null;
     private static ConfigLoader configLoader;
-    private static volatile ExecutorService sharedExecutor;
+    private static volatile ThreadPoolExecutor sharedExecutor;
+    private static ThreadPoolExecutor scanDispatcher;
     private static volatile int sharedExecutorThreads = -1;
 
     public static void setConfigLoader(ConfigLoader loader) {
@@ -299,47 +300,78 @@ public class Utils {
      * 全局共享线程池（避免每次扫描创建大量线程池导致资源耗尽）
      */
     public static synchronized ExecutorService getSharedExecutor(int threads) {
-        int n = threads;
-        if (n <= 0) {
-            n = 1;
-        }
-        if (sharedExecutor == null || sharedExecutor.isShutdown() || sharedExecutor.isTerminated() || sharedExecutorThreads != n) {
-            ExecutorService old = sharedExecutor;
-            BlockingQueue<Runnable> queue = new LinkedBlockingQueue<>(Math.max(100, n * 100));
-            sharedExecutor = new ThreadPoolExecutor(n, n,
-                    0L, TimeUnit.MILLISECONDS,
-                    queue,
-                    new ThreadFactory() {
-                private final AtomicInteger idx = new AtomicInteger(1);
-
-                @Override
-                public Thread newThread(Runnable r) {
-                    Thread t = new Thread(r);
-                    t.setName("BypassPro-" + idx.getAndIncrement());
-                    return t;
-                }
-            },
-                    new ThreadPoolExecutor.CallerRunsPolicy());
+        int n = Math.max(1, Math.min(100, threads));
+        if (sharedExecutor == null || sharedExecutor.isShutdown()) {
+            sharedExecutor = new ThreadPoolExecutor(n, n, 0L, TimeUnit.MILLISECONDS,
+                    new LinkedBlockingQueue<>(100), daemonFactory("BypassPro-Worker-"),
+                    new ThreadPoolExecutor.AbortPolicy());
             sharedExecutorThreads = n;
-            if (old != null) {
-                try {
-                    old.shutdown();
-                } catch (Exception ignored) {}
+        } else if (sharedExecutorThreads != n && sharedExecutor.getActiveCount() == 0 && sharedExecutor.getQueue().isEmpty()) {
+            // A changed limit applies after current work drains; never create overlapping pools.
+            if (n > sharedExecutorThreads) {
+                sharedExecutor.setMaximumPoolSize(n);
+                sharedExecutor.setCorePoolSize(n);
+            } else {
+                sharedExecutor.setCorePoolSize(n);
+                sharedExecutor.setMaximumPoolSize(n);
             }
+            sharedExecutorThreads = n;
         }
         return sharedExecutor;
     }
 
-    public static synchronized void shutdownSharedExecutor() {
-        if (sharedExecutor != null) {
-            try {
-                sharedExecutor.shutdownNow();
-            } catch (Exception ignored) {}
-            sharedExecutor = null;
-            sharedExecutorThreads = -1;
+    private static ThreadFactory daemonFactory(String prefix) {
+        AtomicInteger sequence = new AtomicInteger();
+        return r -> {
+            Thread t = new Thread(r, prefix + sequence.incrementAndGet());
+            t.setDaemon(true);
+            return t;
+        };
+    }
+
+    static synchronized boolean dispatchScan(Runnable action) {
+        if (scanDispatcher == null || scanDispatcher.isShutdown())
+            scanDispatcher = new ThreadPoolExecutor(1, 1, 0L, TimeUnit.MILLISECONDS,
+                    new LinkedBlockingQueue<>(100), daemonFactory("BypassPro-Prepare-"));
+        try { scanDispatcher.execute(action); return true; }
+        catch (java.util.concurrent.RejectedExecutionException e) { return false; }
+    }
+
+    static void submitScan(ExecutorService executor, ScanSession session, Runnable action) {
+        if (session.cancelled) return;
+        Runnable guarded = () -> {
+            if (session.cancelled) return;
+            session.started();
+            if (panel != null) panel.refreshScan(session);
+            try { action.run(); }
+            finally {
+                session.ended();
+                if (panel != null) panel.refreshScan(session);
+            }
+        };
+        // Backpressure is confined to the single preparation thread, never a Burp/EDT sender.
+        while (!session.cancelled && !executor.isShutdown()) {
+            try { executor.execute(guarded); return; }
+            catch (java.util.concurrent.RejectedExecutionException e) {
+                try { TimeUnit.MILLISECONDS.sleep(25); }
+                catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); return; }
+            }
         }
     }
 
+    static synchronized void discardPendingScans() {
+        if (scanDispatcher != null) scanDispatcher.getQueue().clear();
+        if (sharedExecutor != null) sharedExecutor.getQueue().clear();
+    }
+
+    public static synchronized void shutdownSharedExecutor() {
+        isProxySelected = false;
+        if (scanDispatcher != null) scanDispatcher.shutdownNow();
+        if (sharedExecutor != null) sharedExecutor.shutdownNow();
+        scanDispatcher = null;
+        sharedExecutor = null;
+        sharedExecutorThreads = -1;
+    }
 
     public static String getBodyTitle(String s) {
         String regex;
